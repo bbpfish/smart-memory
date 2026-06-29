@@ -76,6 +76,31 @@ python scripts/memory.py <command> [options]
 └── INDEX.md               # 人类可读摘要
 ```
 
+## 自动化维护（铲屎将）
+
+安装技能后建议创建定时任务，每日自动执行记忆优化与技能自进化：
+
+```bash
+bash scripts/maintenance.sh
+```
+
+**执行流程**：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 对话收割 | 从最近 1 天对话中启发式提取候选知识卡片 |
+| 2 | 语义去重 | 检测高度相似的记忆对，避免冗余 |
+| 3 | 索引重建 | 新卡片纳入 TF-IDF 索引，保证召回率 |
+
+**接入定时**（任选一种）：
+
+| 框架 | 方式 |
+|------|------|
+| Marvis | 安装后告诉 Agent：「帮我创建定时任务，每天凌晨 3 点执行 `python scripts/memory.py harvest --days 1 --auto-confirm && python scripts/memory.py dedup && python scripts/memory.py build-index`」 |
+| Linux cron | `0 3 * * * bash /path/to/smart-memory/scripts/maintenance.sh` |
+| Windows 计划任务 | 触发器每日一次，操作为 `bash maintenance.sh` |
+| GitHub Actions | `schedule: cron: '0 3 * * *'` |
+
 ## 兼容性
 
 本技能遵循 [AgentSkills 开放标准](https://github.com/anthropics/agent-skills)（Anthropic 2025），开箱兼容：
