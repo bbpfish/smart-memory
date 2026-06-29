@@ -1,0 +1,895 @@
+#!/usr/bin/env python3
+r"""
+smart-memory CLI — 分层记忆管理系统
+
+Store: D:\hi\.agents\memory\smart-memory\v1\users\hi\
+
+架构:
+  sessions/       — 会话级记忆（自动收割的快照）
+  knowledge/      — 项目级知识卡片 + TF-IDF 索引
+  recommendations.jsonl — 改进建议
+  signals.jsonl   — 使用信号与衰减追踪
+  INDEX.md        — 人类可读摘要
+
+依赖: Python stdlib only
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# ── 路径常量 ──────────────────────────────────────────
+SKILL_DIR = Path(__file__).resolve().parent.parent
+STORE_ROOT = Path("D:/hi/.agents/memory/smart-memory/v1/users/hi")
+SESSION_DIR = STORE_ROOT / "sessions"
+KNOWLEDGE_DIR = STORE_ROOT / "knowledge"
+CARDS_FILE = KNOWLEDGE_DIR / "cards.jsonl"
+INDEX_FILE = KNOWLEDGE_DIR / "index.json"
+RECS_FILE = STORE_ROOT / "recommendations.jsonl"
+SIGNALS_FILE = STORE_ROOT / "signals.jsonl"
+INDEX_MD = STORE_ROOT / "INDEX.md"
+
+# ── 工具函数 ──────────────────────────────────────────
+def iso_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _ts_to_dt(ts: str) -> _dt.datetime:
+    s = ts.strip().replace(" ", "T").replace("Z", "+00:00")
+    return _dt.datetime.fromisoformat(s)
+
+def _hash_id(text: str, prefix: str = "sm") -> str:
+    h = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}_{h}"
+
+def _load_jsonl(path: Path) -> List[Dict]:
+    if not path.exists():
+        return []
+    items = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return items
+
+def _append_jsonl(path: Path, obj: Dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+def _write_json(path: Path, obj: Any):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def _read_json(path: Path) -> Any:
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# ── TF-IDF 简易索引 ───────────────────────────────────
+class TfidfIndex:
+    """轻量 TF-IDF 索引，无外部依赖"""
+
+    def __init__(self, index_path: Path = INDEX_FILE):
+        self.index_path = index_path
+        self.documents: Dict[str, Dict] = {}   # id → {tokens, weights}
+        self.idf: Dict[str, float] = {}
+        self._dirty = False
+
+    def load(self):
+        data = _read_json(self.index_path)
+        if data:
+            self.documents = data.get("documents", {})
+            self.idf = data.get("idf", {})
+        return self
+
+    def save(self):
+        _write_json(self.index_path, {
+            "documents": self.documents,
+            "idf": self.idf,
+            "updated": iso_now()
+        })
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        """中文按字+2-gram，英文按词，去停用词"""
+        # 简易 tokenizer
+        tokens = []
+        # 提取中文字符
+        cn_chars = re.findall(r'[\u4e00-\u9fff]+', text.lower())
+        for seg in cn_chars:
+            if len(seg) >= 2:
+                for i in range(len(seg) - 1):
+                    tokens.append(seg[i:i + 2])
+            tokens.append(seg)
+        # 提取英文词
+        en_words = re.findall(r'[a-z0-9]{2,}', text.lower())
+        tokens.extend(en_words)
+        # 过滤纯数字和单字符
+        stop_words = {'the', 'and', 'for', 'with', 'this', 'that', 'from', 'have', 'has'}
+        return [t for t in tokens if t not in stop_words and not t.isdigit()]
+
+    def add(self, doc_id: str, text: str, weight: float = 1.0):
+        tokens = self._tokenize(text)
+        tf = Counter(tokens)
+        self.documents[doc_id] = {"tokens": tokens, "weights": dict(tf), "base_weight": weight}
+        # 更新 IDF
+        n = len(self.documents)
+        for token in set(tokens):
+            df = sum(1 for d in self.documents.values() if token in d["weights"])
+            self.idf[token] = math.log((n + 1) / (df + 1)) + 1.0
+        self._dirty = True
+
+    def remove(self, doc_id: str):
+        if doc_id in self.documents:
+            del self.documents[doc_id]
+            self._dirty = True
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        query_tokens = self._tokenize(query)
+        if not query_tokens:
+            return []
+        scores: Dict[str, float] = {}
+        q_tf = Counter(query_tokens)
+        q_len = math.sqrt(sum(v ** 2 for v in q_tf.values()))
+        for doc_id, doc in self.documents.items():
+            d_weights = doc["weights"]
+            dot = 0.0
+            d_len_sq = 0.0
+            for token, d_w in d_weights.items():
+                d_len_sq += d_w ** 2
+                if token in q_tf:
+                    idf = self.idf.get(token, 1.0)
+                    dot += q_tf[token] * d_w * (idf ** 2)
+            d_len = math.sqrt(d_len_sq)
+            if q_len > 0 and d_len > 0:
+                cosine = dot / (q_len * d_len)
+                base_w = doc.get("base_weight", 1.0)
+                scores[doc_id] = cosine * base_w
+        return sorted(scores.items(), key=lambda x: -x[1])[:top_k]
+
+
+# ── 核心操作 ──────────────────────────────────────────
+
+def recall(query: str = "", tags: List[str] = None, top_k: int = 10, days: int = 30) -> List[Dict]:
+    """
+    任务前召回：TF-IDF 匹配 + 标签过滤 + 时间衰减
+    """
+    idx = TfidfIndex().load()
+    cards_all = _load_jsonl(CARDS_FILE)
+    # 建立 id→card 映射（取最新版本）
+    card_map: Dict[str, Dict] = {}
+    for c in cards_all:
+        cid = c.get("id", "")
+        if cid:
+            card_map[cid] = c
+
+    # 搜索
+    if query:
+        hits = idx.search(query, top_k=top_k * 2)
+    else:
+        # 无 query 时返回最近高权重的
+        hits = [(cid, c.get("weight", 1.0)) for cid, c in card_map.items()]
+        hits.sort(key=lambda x: -x[1])
+
+    # 标签过滤
+    if tags:
+        tag_set = set(tags)
+        hits = [(cid, s) for cid, s in hits
+                if cid in card_map and tag_set & set(card_map[cid].get("tags", []))]
+
+    # 时间衰减 + 去重
+    now = _dt.datetime.now(_dt.timezone.utc)
+    results = []
+    seen_titles = set()
+    for card_id, score in hits:
+        card = card_map.get(card_id)
+        if not card:
+            continue
+        ts = card.get("ts", iso_now())
+        try:
+            age_days = (now - _ts_to_dt(ts)).days
+        except Exception:
+            age_days = 0
+        # 衰减因子：30天半衰期
+        decay = 0.5 ** (age_days / 30.0)
+        final_score = score * decay
+
+        # 去重：相似 title
+        title_key = card.get("title", "").strip().lower()[:20]
+        if title_key in seen_titles and final_score < 1.0:
+            continue
+        seen_titles.add(title_key)
+
+        if final_score > 0.01 or not query:
+            results.append({**card, "_score": round(final_score, 4)})
+
+    results.sort(key=lambda x: -x["_score"])
+    # 自动为召回结果写信号
+    for r in results[:top_k]:
+        signal("card_recalled", r["id"], context=f"query={query[:60]}")
+    return results[:top_k]
+
+
+def _normalize_sig(text: str) -> str:
+    """标准化签名文本：去首尾空白、压缩连续空格、统一换行"""
+    return re.sub(r'\s+', ' ', text.strip().lower())
+
+
+def record(title: str, when_to_use: str, problem: str,
+           solution_steps: List[str], evidence: List[str] = None,
+           tags: List[str] = None, gotchas: List[str] = None,
+           scope: str = "project", **kwargs):
+    """
+    记录一条知识卡片，自动去重与索引，自动写信号。
+    """
+    # 标准化签名文本（去空格差异、大小写差异）
+    sig_title = _normalize_sig(title)
+    sig_when = _normalize_sig(when_to_use)
+    sig_problem = _normalize_sig(problem)
+    sig_text = f"{sig_title}|{sig_when}|{sig_problem}"
+    card_id = _hash_id(sig_text, "smc")
+
+    # 检查是否已存在相似卡片（ID 精确匹配 OR title 相近匹配）
+    existing = _load_jsonl(CARDS_FILE)
+    seen_ids = set()
+    for old in reversed(existing):  # 从最新开始查
+        old_id = old.get("id", "")
+        if old_id in seen_ids:
+            continue
+        seen_ids.add(old_id)
+
+        # 精确 ID 匹配
+        if old_id == card_id:
+            old_weight = old.get("weight", 1.0)
+            new_card = {**old, "weight": round(old_weight + 0.5, 2),
+                       "reinforced_ts": iso_now(), "reinforced_count": old.get("reinforced_count", 0) + 1}
+            _append_jsonl(CARDS_FILE, new_card)
+            idx = TfidfIndex().load()
+            if card_id in idx.documents:
+                idx.documents[card_id]["base_weight"] = new_card["weight"]
+                idx.save()
+            signal("card_reinforced", card_id, context=title)
+            return {"id": card_id, "action": "reinforced", "weight": new_card["weight"]}
+
+        # 标题相似匹配（前 50 字符完全相同 → 视为同一经验）
+        old_title = _normalize_sig(old.get("title", ""))
+        if old_title[:50] == sig_title[:50] and len(old_title) > 10:
+            # 合并 solution_steps
+            merged_solutions = list(dict.fromkeys(
+                (old.get("solution_steps") or []) + (solution_steps or [])
+            ))
+            merged_evidence = list(dict.fromkeys(
+                (old.get("evidence") or []) + (evidence or [])
+            ))
+            new_card = {
+                **old,
+                "weight": round(old.get("weight", 1.0) + 0.3, 2),
+                "reinforced_ts": iso_now(),
+                "reinforced_count": old.get("reinforced_count", 0) + 1,
+                "solution_steps": merged_solutions,
+                "evidence": merged_evidence,
+                "problem": problem if len(problem) > len(old.get("problem", "")) else old.get("problem", ""),
+            }
+            _append_jsonl(CARDS_FILE, new_card)
+            signal("card_merged", old_id, context=f"title match: {title[:60]}")
+            return {"id": old_id, "action": "merged", "weight": new_card["weight"]}
+
+    # 新卡片 — 写入前做二次去重检查（防护并发写入导致重复行）
+    card = {
+        "id": card_id,
+        "ts": iso_now(),
+        "title": title,
+        "when_to_use": when_to_use,
+        "problem": problem,
+        "solution_steps": solution_steps,
+        "evidence": evidence or [],
+        "tags": tags or [],
+        "gotchas": gotchas or [],
+        "scope": scope,
+        "weight": 1.0,
+        "reinforced_count": 0,
+        "status": "active",
+    }
+    # Merge kwargs keys not already in card
+    for k, v in kwargs.items():
+        if k not in card:
+            card[k] = v
+    # 二次确认：重新读取文件最新状态，避免并发/批量写入导致的 ID 重复
+    final_check = _load_jsonl(CARDS_FILE)
+    for old in reversed(final_check):
+        if old.get("id") == card_id:
+            # 并发场景下已有同样卡片，按 reinforcement 处理
+            old_weight = old.get("weight", 1.0)
+            merged_card = {**old, "weight": round(old_weight + 0.5, 2),
+                          "reinforced_ts": iso_now(),
+                          "reinforced_count": old.get("reinforced_count", 0) + 1}
+            _append_jsonl(CARDS_FILE, merged_card)
+            signal("card_reinforced", card_id, context=f"concurrent dedup: {title[:60]}")
+            return {"id": card_id, "action": "reinforced_concurrent", "weight": merged_card["weight"]}
+    _append_jsonl(CARDS_FILE, card)
+
+    # 建索引
+    index_text = f"{title} {when_to_use} {problem} {' '.join(tags or [])}"
+    idx = TfidfIndex().load()
+    idx.add(card_id, index_text, weight=1.0)
+    idx.save()
+
+    # 自动写信号
+    signal("card_recorded", card_id, context=title[:80])
+
+    return {"id": card_id, "action": "created", "weight": 1.0}
+
+
+def signal(kind: str, card_id: str, context: str = ""):
+    """记录使用信号"""
+    _append_jsonl(SIGNALS_FILE, {
+        "ts": iso_now(),
+        "kind": kind,
+        "card_id": card_id,
+        "context": context
+    })
+    # 更新卡片权重
+    weight_inc = {"card_used": 0.3, "card_reinforced": 0.5, "card_recalled": 0.1}.get(kind, 0.1)
+    cards = _load_jsonl(CARDS_FILE)
+    for c in reversed(cards):
+        if c.get("id") == card_id:
+            new_w = round(c.get("weight", 1.0) + weight_inc, 2)
+            _append_jsonl(CARDS_FILE, {**c, "weight": new_w, "last_used_ts": iso_now()})
+            break
+
+
+def session_snapshot(events: List[Dict], task_summary: str = ""):
+    """会话结束快照：持久化会话摘要"""
+    session_id = _hash_id(f"{iso_now()}{task_summary}", "ses")
+    snapshot = {
+        "session_id": session_id,
+        "ts": iso_now(),
+        "task_summary": task_summary,
+        "events": events,
+    }
+    _append_jsonl(SESSION_DIR / f"{_dt.datetime.now().strftime('%Y%m%d')}.jsonl", snapshot)
+    return session_id
+
+
+# ── 自动收割：启发式提取 ──────────────────────────────
+
+# 关键词模式 — 匹配值得持久化的发现
+DISCOVERY_PATTERNS = [
+    (re.compile(r"(发现|注意|关键|重要|记住|规律|经验|教训|坑[：:点]?|踩坑|陷阱|gotcha|tip|note).{0,30}?[：:：]\s*(.+)"), "发现"),
+    (re.compile(r"(问题|原因|根因|bug|error|错误|失败).{0,20}?(是|在于|由于|因为|出在)\s*(.+)"), "问题根因"),
+    (re.compile(r"(解决|修复|fix|workaround|绕过|hack).{0,20}?[：:：]?\s*(.+)"), "解决方案"),
+    (re.compile(r"(命令|command|cmd|cli|脚本).{0,10}?[：:：]?\s*(`.+?`|[\w\-./\\]+)", re.I), "命令/脚本"),
+    (re.compile(r"(配置|config|设置|参数|param).{0,20}?[：:：]?\s*(.+)"), "配置/参数"),
+    (re.compile(r"(文件|路径|path|file|目录).{0,10}?[：:：]?\s*([A-Za-z]:[^\s,，。]+)", re.I), "文件路径"),
+    (re.compile(r"(流程|步骤|pipeline|workflow|pattern).{0,10}?[：:：]?\s*(.+)"), "流程/模式"),
+    (re.compile(r"(不再|不要|禁止|避免|never|don't|avoid|should not)\s*(.+)"), "禁忌规则"),
+]
+
+# 关键动词 — 一句话是否是"值得记住的"
+SIGNAL_VERBS = {"发现", "注意", "关键", "重要", "记住", "经验", "教训", "坑", "踩坑",
+                "陷阱", "gotcha", "tip", "note", "问题", "原因", "解决", "修复",
+                "禁止", "不要", "避免", "必须", "required", "配置", "设置"}
+
+
+def harvest_from_text(text: str, auto_confirm: bool = False) -> List[Dict]:
+    """
+    从对话摘要文本中启发式提取候选知识卡片。
+
+    输入：Agent 对本轮对话的摘要文本（中文/英文混排）
+    输出：候选卡片列表，每项包含 title/when_to_use/problem/solution_steps 等字段
+    """
+    candidates = []
+    lines = text.split("\n")
+
+    # 按段落聚合上下文
+    paragraphs = []
+    current = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+        else:
+            current.append(stripped)
+    if current:
+        paragraphs.append(" ".join(current))
+
+    for para in paragraphs:
+        # 跳过过短的段落
+        if len(para) < 10:
+            continue
+
+        # 检查是否包含信号动词
+        has_signal = any(v in para for v in SIGNAL_VERBS)
+        if not has_signal:
+            continue
+
+        # 尝试匹配模式
+        for pattern, category in DISCOVERY_PATTERNS:
+            m = pattern.search(para)
+            if m:
+                groups = m.groups()
+                # 提取有效内容（取最后一个非空捕获组）
+                content = ""
+                for g in reversed(groups):
+                    if g and len(g.strip()) > 3:
+                        content = g.strip()
+                        break
+                if not content:
+                    continue
+
+                # 构建卡片
+                title = f"{category}：{content[:60]}"
+                if len(content) > 60:
+                    title += "..."
+
+                card = {
+                    "title": title,
+                    "when_to_use": _extract_when(para, category),
+                    "problem": para[:200],
+                    "solution_steps": [content],
+                    "tags": _extract_tags(para),
+                    "scope": "project",
+                    "_source_category": category,
+                    "_source_text": para[:300],
+                }
+                candidates.append(card)
+                break  # 每个段落只匹配第一个成功模式
+
+    # 去重：按 title 相似度
+    unique = []
+    seen_titles = set()
+    for c in candidates:
+        title_key = c["title"][:30]
+        if title_key not in seen_titles:
+            seen_titles.add(title_key)
+            unique.append(c)
+
+    # 自动确认写入
+    if auto_confirm:
+        results = []
+        for c in unique:
+            r = record(
+                title=c["title"],
+                when_to_use=c["when_to_use"],
+                problem=c["problem"],
+                solution_steps=c["solution_steps"],
+                tags=c["tags"],
+                scope=c["scope"],
+            )
+            results.append({"candidate": c["title"][:50], "result": r})
+        return results
+
+    return unique
+
+
+def _extract_when(text: str, category: str) -> str:
+    """从文本推断触发条件"""
+    when_map = {
+        "发现": "遇到类似场景时",
+        "问题根因": "出现相同错误/异常时",
+        "解决方案": "需要修复同类问题时",
+        "命令/脚本": "执行相关操作时",
+        "配置/参数": "配置相关服务时",
+        "文件路径": "查找相关文件时",
+        "流程/模式": "执行相似任务时",
+        "禁忌规则": "可能触发同类错误时",
+    }
+    # 尝试从原文提取更具体的触发条件
+    m = re.search(r"(当|遇到|出现|执行|配置|使用).{0,30}?(时|的时候)", text)
+    if m:
+        return m.group(0)
+    return when_map.get(category, "相关场景")
+
+
+def _extract_tags(text: str) -> List[str]:
+    """从文本提取关键词作为标签"""
+    tags = []
+    # 文件扩展名
+    exts = set(re.findall(r"\.([a-z]{2,5})\b", text.lower()))
+    tags.extend([f"ext:{e}" for e in exts if e not in {"com", "org", "net", "txt", "md"}])
+
+    # 技术关键词
+    tech_keywords = {
+        "docker": "docker", "git": "git", "api": "api", "json": "json",
+        "yaml": "yaml", "python": "python", "powershell": "powershell",
+        "ssh": "ssh", "http": "http", "proxy": "proxy", "代理": "proxy",
+        "数据库": "database", "定时任务": "scheduler", "记忆": "memory",
+        "索引": "index", "alist": "alist", "pepe": "pepe-arena",
+        "macd": "macd", "rsi": "rsi", "adx": "adx", "交易": "trading",
+        "信号": "signal", "策略": "strategy", "配置": "config",
+        "编码": "encoding", "编码损坏": "encoding",
+    }
+    for kw, tag in tech_keywords.items():
+        if kw in text.lower():
+            tags.append(tag)
+
+    return tags[:8]
+
+
+def session_list(days: int = 7) -> List[Dict]:
+    """列出最近的会话快照"""
+    snapshots = []
+    cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days)
+    if not SESSION_DIR.exists():
+        return []
+    for f in sorted(SESSION_DIR.glob("*.jsonl"), reverse=True):
+        items = _load_jsonl(f)
+        for item in items:
+            ts = item.get("ts", "")
+            try:
+                dt = _ts_to_dt(ts)
+            except Exception:
+                continue
+            if dt >= cutoff:
+                snapshots.append(item)
+    return snapshots
+
+
+def review(days: int = 7, query: str = "", tags: List[str] = None, status: str = None):
+    """回顾面板"""
+    cards = _load_jsonl(CARDS_FILE)
+    # 去重取最新
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid:
+            latest[cid] = c
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    results = []
+    for cid, c in latest.items():
+        if status and c.get("status") != status:
+            continue
+        ts = c.get("ts", iso_now())
+        try:
+            age_days = (now - _ts_to_dt(ts)).days
+        except Exception:
+            age_days = 0
+        if age_days > days:
+            continue
+        # 计算当前有效权重（含衰减）
+        decay = 0.5 ** (age_days / 30.0)
+        eff_weight = c.get("weight", 1.0) * decay
+        results.append({**c, "_age_days": age_days, "_eff_weight": round(eff_weight, 3)})
+
+    if query:
+        # TF-IDF 辅助排序
+        idx = TfidfIndex().load()
+        tfidf_hits = dict(idx.search(query, top_k=200))
+        for r in results:
+            r["_score"] = r["_eff_weight"] + tfidf_hits.get(r["id"], 0)
+        results.sort(key=lambda x: -x["_score"])
+    else:
+        results.sort(key=lambda x: -x["_eff_weight"])
+
+    if tags:
+        tag_set = set(tags)
+        results = [r for r in results if tag_set & set(r.get("tags", []))]
+
+    return results
+
+
+def dedup(threshold: float = 0.45) -> List[Dict]:
+    """
+    全文语义相似度去重检测。
+    使用 TF-IDF 索引对所有卡片做 pairwise 余弦相似度比对，
+    返回超过阈值的相似对及其相似度得分。
+    """
+    idx = TfidfIndex().load()
+    if not idx.documents:
+        return []
+
+    cards = _load_jsonl(CARDS_FILE)
+    # 取每个 ID 的最新版本
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid and c.get("status") != "deprecated":
+            latest[cid] = c
+
+    doc_ids = [cid for cid in latest if cid in idx.documents]
+    n = len(doc_ids)
+    if n < 2:
+        return []
+
+    # 预计算所有文档的 TF-IDF 向量和模长
+    vectors = {}
+    norms = {}
+    for cid in doc_ids:
+        doc = idx.documents[cid]
+        weights = doc.get("weights", {})
+        vec = {}
+        sq_sum = 0.0
+        for token, tf in weights.items():
+            idf_val = idx.idf.get(token, 1.0)
+            w = tf * idf_val
+            vec[token] = w
+            sq_sum += w ** 2
+        vectors[cid] = vec
+        norms[cid] = math.sqrt(sq_sum)
+
+    # pairwise 余弦相似度
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            cid_a, cid_b = doc_ids[i], doc_ids[j]
+            va, vb = vectors[cid_a], vectors[cid_b]
+            # 取交集 token 计算点积
+            if len(va) > len(vb):
+                va, vb = vb, va
+            dot = 0.0
+            for token, wa in va.items():
+                wb = vb.get(token, 0.0)
+                dot += wa * wb
+            na, nb = norms[cid_a], norms[cid_b]
+            cos_sim = dot / (na * nb) if na > 0 and nb > 0 else 0.0
+
+            if cos_sim >= threshold:
+                ca = latest[cid_a]
+                cb = latest[cid_b]
+                pairs.append({
+                    "card_a": {"id": cid_a, "title": ca.get("title", ""),
+                               "tags": ca.get("tags", []), "status": ca.get("status", "")},
+                    "card_b": {"id": cid_b, "title": cb.get("title", ""),
+                               "tags": cb.get("tags", []), "status": cb.get("status", "")},
+                    "similarity": round(cos_sim, 4),
+                })
+
+    pairs.sort(key=lambda x: -x["similarity"])
+    return pairs
+
+
+def build_index():
+    """全量重建索引"""
+    cards = _load_jsonl(CARDS_FILE)
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid:
+            latest[cid] = c
+
+    idx = TfidfIndex()
+    for cid, c in latest.items():
+        if c.get("status") == "deprecated":
+            continue
+        text = f"{c.get('title','')} {c.get('when_to_use','')} {c.get('problem','')} {' '.join(c.get('tags',[]))}"
+        idx.add(cid, text, weight=c.get("weight", 1.0))
+    idx.save()
+    return len(idx.documents)
+
+
+def migrate_from_selflearning():
+    """从旧 self-learning-skills 迁移数据"""
+    old_store = Path("D:/hi/.agents/memory/self-learning/v1/users/hi")
+    if not old_store.exists():
+        return {"error": "旧存储不存在", "path": str(old_store)}
+
+    old_cards = _load_jsonl(old_store / "aha_cards.jsonl")
+    migrated = 0
+    skipped = 0
+
+    for c in old_cards:
+        cid = c.get("id", "")
+        title = c.get("title", "")
+        if not title or not cid:
+            skipped += 1
+            continue
+
+        # 转换格式
+        new_card = {
+            "id": cid,
+            "ts": c.get("ts", iso_now()),
+            "title": title,
+            "when_to_use": c.get("when_to_use", ""),
+            "problem": c.get("problem", ""),
+            "solution_steps": c.get("solution_steps", []),
+            "evidence": c.get("evidence", []),
+            "tags": c.get("tags", []),
+            "gotchas": c.get("gotchas", []),
+            "scope": c.get("scope", "project"),
+            "weight": 1.0,
+            "reinforced_count": 0,
+            "status": c.get("status", "active"),
+            "_migrated_from": "self-learning-v1"
+        }
+        _append_jsonl(CARDS_FILE, new_card)
+        migrated += 1
+        # 内容不为空的卡片自动写信号
+        if title or c.get("problem") or c.get("solution_steps"):
+            signal("card_recorded", cid, context=title[:80])
+
+    # 迁移推荐
+    old_recs = _load_jsonl(old_store / "recommendations.jsonl")
+    for r in old_recs:
+        rid = r.get("id", "")
+        if not rid:
+            continue
+        new_rec = {
+            "id": rid,
+            "ts": r.get("ts", iso_now()),
+            "title": r.get("title", ""),
+            "why": r.get("why", ""),
+            "impact": r.get("expected_impact", {}),
+            "hint": r.get("implementation_hint", ""),
+            "tags": r.get("tags", []),
+            "scope": r.get("scope", "project"),
+            "status": r.get("status", "proposed"),
+            "_migrated_from": "self-learning-v1"
+        }
+        _append_jsonl(RECS_FILE, new_rec)
+
+    # 建索引
+    n_indexed = build_index()
+
+    return {"migrated_cards": migrated, "skipped": skipped, "indexed": n_indexed}
+
+
+# ── CLI ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="smart-memory CLI")
+    sub = parser.add_subparsers(dest="command")
+
+    # recall
+    p_recall = sub.add_parser("recall", help="任务前召回相关记忆")
+    p_recall.add_argument("--query", "-q", default="", help="搜索关键词")
+    p_recall.add_argument("--tags", "-t", nargs="*", help="标签过滤")
+    p_recall.add_argument("--top", type=int, default=10, help="返回数量")
+    p_recall.add_argument("--days", type=int, default=30, help="时间范围（天）")
+    p_recall.add_argument("--format", default="text", choices=["text", "json"])
+
+    # record
+    p_record = sub.add_parser("record", help="记录知识卡片")
+    p_record.add_argument("--title", required=True)
+    p_record.add_argument("--when", default="", help="触发条件")
+    p_record.add_argument("--problem", default="", help="问题描述")
+    p_record.add_argument("--solution", nargs="*", default=[], help="解决步骤")
+    p_record.add_argument("--evidence", nargs="*", default=[], help="证据/来源")
+    p_record.add_argument("--tags", nargs="*", default=[], help="标签")
+    p_record.add_argument("--gotchas", nargs="*", default=[], help="坑点")
+    p_record.add_argument("--scope", default="project")
+
+    # signal
+    p_signal = sub.add_parser("signal", help="记录使用信号")
+    p_signal.add_argument("--kind", required=True)
+    p_signal.add_argument("--card-id", required=True)
+    p_signal.add_argument("--context", default="")
+
+    # review
+    p_review = sub.add_parser("review", help="回顾面板")
+    p_review.add_argument("--days", type=int, default=7)
+    p_review.add_argument("--query", "-q", default="")
+    p_review.add_argument("--tags", nargs="*")
+    p_review.add_argument("--status", default="")
+    p_review.add_argument("--format", default="text", choices=["text", "json"])
+
+    # session
+    p_session = sub.add_parser("session", help="会话快照")
+    p_session.add_argument("--summary", default="", help="任务摘要")
+
+    # harvest
+    p_harvest = sub.add_parser("harvest", help="从对话摘要自动提取知识卡片")
+    p_harvest.add_argument("--text", required=True, help="对话摘要文本")
+    p_harvest.add_argument("--auto-confirm", action="store_true", help="直接写入（跳过审查）")
+
+    # session-list
+    p_sesslist = sub.add_parser("session-list", help="列出历史会话快照")
+    p_sesslist.add_argument("--days", type=int, default=7)
+
+    # build-index
+    sub.add_parser("build-index", help="全量重建索引")
+
+    # dedup
+    p_dedup = sub.add_parser("dedup", help="全文语义去重检测")
+    p_dedup.add_argument("--threshold", type=float, default=0.45, help="相似度阈值 (0.0~1.0)")
+
+    # migrate
+    sub.add_parser("migrate", help="从 self-learning-skills 迁移")
+
+    args = parser.parse_args()
+
+    if args.command == "recall":
+        results = recall(query=args.query, tags=args.tags, top_k=args.top, days=args.days)
+        if args.format == "json":
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            print(f"\n── 记忆召回 (query='{args.query}', top={len(results)}) ──\n")
+            for i, r in enumerate(results, 1):
+                print(f"  [{i}] [{r['_score']:.2f}] {r['title']}  ({r['id']})")
+                print(f"      触发: {r.get('when_to_use','')[:60]}")
+                if r.get('tags'):
+                    print(f"      标签: {', '.join(r['tags'][:5])}")
+                print()
+
+    elif args.command == "record":
+        result = record(
+            title=args.title, when_to_use=args.when, problem=args.problem,
+            solution_steps=args.solution, evidence=args.evidence,
+            tags=args.tags, gotchas=args.gotchas, scope=args.scope
+        )
+        print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == "signal":
+        signal(kind=args.kind, card_id=args.card_id, context=args.context)
+        print(f"signal recorded: {args.kind} → {args.card_id}")
+
+    elif args.command == "review":
+        results = review(days=args.days, query=args.query, tags=args.tags, status=args.status)
+        if args.format == "json":
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            print(f"\n── 记忆回顾 (days={args.days}, {len(results)} 条) ──\n")
+            if not results:
+                print("  (无记录)")
+            for i, r in enumerate(results, 1):
+                w = r.get('_eff_weight', r.get('weight', 1))
+                age = r.get('_age_days', '?')
+                print(f"  [{i}] [w={w:.2f}, {age}d] {r['title']}  ({r['id']})")
+                print(f"      状态: {r.get('status','?')}  触发: {r.get('when_to_use','')[:50]}")
+
+    elif args.command == "session":
+        sid = session_snapshot([], task_summary=args.summary)
+        print(f"session snapshot: {sid}")
+
+    elif args.command == "harvest":
+        candidates = harvest_from_text(text=args.text, auto_confirm=args.auto_confirm)
+        if args.auto_confirm:
+            print(json.dumps(candidates, ensure_ascii=False, indent=2))
+        else:
+            print(f"\n── 收割候选 ({len(candidates)} 条) ──\n")
+            if not candidates:
+                print("  (未发现可提取的知识卡片)")
+            for i, c in enumerate(candidates, 1):
+                print(f"  [{i}] [{c['_source_category']}] {c['title']}")
+                print(f"      触发: {c['when_to_use']}")
+                print(f"      标签: {', '.join(c.get('tags', []))}")
+                print(f"      原文: {c.get('_source_text', '')[:80]}...")
+                print()
+
+    elif args.command == "session-list":
+        snaps = session_list(days=args.days)
+        print(f"\n── 会话快照 (近{args.days}天, {len(snaps)} 条) ──\n")
+        if not snaps:
+            print("  (无记录)")
+        for s in snaps:
+            print(f"  [{s.get('session_id','?')}] {s.get('ts','?')}")
+            print(f"      任务: {s.get('task_summary','')[:80]}")
+
+    elif args.command == "build-index":
+        n = build_index()
+        print(f"index rebuilt: {n} documents")
+
+    elif args.command == "dedup":
+        pairs = dedup(threshold=args.threshold)
+        print(json.dumps(pairs, ensure_ascii=False, indent=2))
+        print(f"\n共 {len(pairs)} 对相似记忆（阈值={args.threshold}）")
+
+    elif args.command == "migrate":
+        result = migrate_from_selflearning()
+        print(json.dumps(result, ensure_ascii=False))
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
