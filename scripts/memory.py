@@ -658,6 +658,36 @@ def dedup(threshold: float = 0.45) -> List[Dict]:
     return pairs
 
 
+def compact() -> Dict:
+    """紧凑化 cards.jsonl：去除重复 ID 行，仅保留每个 ID 的最新版本"""
+    cards = _load_jsonl(CARDS_FILE)
+    if not cards:
+        return {"before": 0, "after": 0, "removed": 0}
+
+    before = len(cards)
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid:
+            latest[cid] = c  # later writes overwrite earlier ones
+
+    # 备份原文件
+    backup_path = Path(str(CARDS_FILE) + ".bak")
+    with open(CARDS_FILE, "r", encoding="utf-8") as src:
+        with open(backup_path, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+
+    # 写入去重版本
+    with open(CARDS_FILE, "w", encoding="utf-8") as f:
+        for cid in sorted(latest.keys()):
+            card = latest[cid]
+            f.write(json.dumps(card, ensure_ascii=False) + "\n")
+
+    after = len(latest)
+    removed = before - after
+    return {"before": before, "after": after, "removed": removed, "backup": str(backup_path)}
+
+
 def build_index():
     """全量重建索引"""
     cards = _load_jsonl(CARDS_FILE)
@@ -798,6 +828,9 @@ def main():
     # build-index
     sub.add_parser("build-index", help="全量重建索引")
 
+    # compact
+    sub.add_parser("compact", help="紧凑化 cards.jsonl，去除重复 ID 行")
+
     # dedup
     p_dedup = sub.add_parser("dedup", help="全文语义去重检测")
     p_dedup.add_argument("--threshold", type=float, default=0.45, help="相似度阈值 (0.0~1.0)")
@@ -877,6 +910,12 @@ def main():
     elif args.command == "build-index":
         n = build_index()
         print(f"index rebuilt: {n} documents")
+
+    elif args.command == "compact":
+        result = compact()
+        print(json.dumps(result, ensure_ascii=False))
+        print(f"\ncompacted: {result['before']} → {result['after']} rows ({result['removed']} duplicates removed)")
+        print(f"backup: {result['backup']}")
 
     elif args.command == "dedup":
         pairs = dedup(threshold=args.threshold)
