@@ -12,6 +12,15 @@
 - **历史迁移**：从 self-learning-skills 一键导入历史数据
 - **对话收割**：从对话文本启发式提取候选知识卡片
 
+## 依赖
+
+| 依赖项 | 说明 |
+|--------|------|
+| Python | 3.8 及以上 |
+| 外部包 | **零依赖**，仅使用 Python 标准库（json / hashlib / argparse / pathlib / collections / math / re / datetime） |
+| 磁盘 | 轻量本地存储（JSONL + JSON），默认路径 `~/.agents/memory/smart-memory/` |
+| API / 网络 | 无，完全离线运行 |
+
 ## 安装
 
 ```bash
