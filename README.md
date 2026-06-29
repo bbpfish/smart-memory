@@ -76,30 +76,29 @@ python scripts/memory.py <command> [options]
 └── INDEX.md               # 人类可读摘要
 ```
 
-## 自动化维护（铲屎将）
+## 自动化维护
 
-安装技能后建议创建定时任务，每日自动执行记忆优化与技能自进化：
+安装技能后建议创建定时任务，每夜自动执行记忆优化与技能自进化。提供两种方案：
+
+### Marvis / Agent 框架（AI 自主维护，推荐）
+完整 6 步闭环：对话收割 → 数据探查 → 异常检测 → 根因诊断 → 分级修复 → 经验沉淀。
+安装后告诉 Marvis：「帮我创建定时任务，每天凌晨 2 点，prompt 见 `schedules/nightly-maintenance.yaml.example`」
+
+### 非 Agent 环境（脚本维护）
+仅执行核心操作（收割 → 去重 → 索引重建），不含 AI 诊断与代码修复。
 
 ```bash
 bash scripts/maintenance.sh
 ```
 
-**执行流程**：
-
-| 步骤 | 操作 | 说明 |
-|------|------|------|
-| 1 | 对话收割 | 从最近 1 天对话中启发式提取候选知识卡片 |
-| 2 | 语义去重 | 检测高度相似的记忆对，避免冗余 |
-| 3 | 索引重建 | 新卡片纳入 TF-IDF 索引，保证召回率 |
-
-**接入定时**（任选一种）：
+**接入定时**：
 
 | 框架 | 方式 |
 |------|------|
-| Marvis | 安装后告诉 Agent：「帮我创建定时任务，每天凌晨 3 点执行 `python scripts/memory.py harvest --days 1 --auto-confirm && python scripts/memory.py dedup && python scripts/memory.py build-index`」 |
-| Linux cron | `0 3 * * * bash /path/to/smart-memory/scripts/maintenance.sh` |
+| Marvis | 使用 `schedules/nightly-maintenance.yaml.example` 中的完整 prompt |
+| Linux cron | `0 2 * * * bash /path/to/smart-memory/scripts/maintenance.sh` |
 | Windows 计划任务 | 触发器每日一次，操作为 `bash maintenance.sh` |
-| GitHub Actions | `schedule: cron: '0 3 * * *'` |
+| GitHub Actions | `schedule: cron: '0 2 * * *'` |
 
 ## 兼容性
 
