@@ -1,0 +1,28 @@
+name: Auto Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/release-please-action@v4
+        with:
+          release-type: simple
+          package-name: smart-memory
+          changelog-types: |
+            [
+              {"type":"feat","section":"Features","hidden":false},
+              {"type":"fix","section":"Bug Fixes","hidden":false},
+              {"type":"docs","section":"Documentation","hidden":false},
+              {"type":"refactor","section":"Refactor","hidden":false},
+              {"type":"perf","section":"Performance","hidden":false},
+              {"type":"chore","section":"Maintenance","hidden":true}
+            ]
+

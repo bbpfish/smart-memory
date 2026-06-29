@@ -1,0 +1,40 @@
+name: Sync Version to SKILL.md
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sync-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update version in SKILL.md
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          if grep -q "^version:" SKILL.md; then
+            sed -i "s/^version: .*$/version: $VERSION/" SKILL.md
+            echo "Updated SKILL.md version to $VERSION"
+          else
+            echo "version: $VERSION" | cat - SKILL.md > /tmp/tmpfile && mv /tmp/tmpfile SKILL.md
+            echo "Inserted version: $VERSION into SKILL.md"
+          fi
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add SKILL.md
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: sync version to ${{ github.event.release.tag_name }}"
+            git push origin main
+          fi
