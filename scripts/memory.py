@@ -24,6 +24,12 @@ import math
 import os
 import re
 import sys
+import time
+
+# ── Windows 控制台编码修复 ─────────────────────────────
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,7 +61,7 @@ def _load_jsonl(path: Path) -> List[Dict]:
     if not path.exists():
         return []
     items = []
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -79,7 +85,7 @@ def _write_json(path: Path, obj: Any):
 def _read_json(path: Path) -> Any:
     if not path.exists():
         return None
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         return json.load(f)
 
 # ── TF-IDF 简易索引 ───────────────────────────────────
@@ -111,6 +117,8 @@ class TfidfIndex:
         """中文按字+2-gram，英文按词，去停用词"""
         # 简易 tokenizer
         tokens = []
+        # 预处理：移除替换字符（U+FFFD），防止编码损坏传播到索引
+        text = text.replace('\ufffd', '')
         # 提取中文字符
         cn_chars = re.findall(r'[\u4e00-\u9fff]+', text.lower())
         for seg in cn_chars:
@@ -673,7 +681,7 @@ def compact() -> Dict:
 
     # 备份原文件
     backup_path = Path(str(CARDS_FILE) + ".bak")
-    with open(CARDS_FILE, "r", encoding="utf-8") as src:
+    with open(CARDS_FILE, "r", encoding="utf-8", errors="replace") as src:
         with open(backup_path, "w", encoding="utf-8") as dst:
             dst.write(src.read())
 
