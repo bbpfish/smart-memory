@@ -42,6 +42,7 @@ KNOWLEDGE_DIR = STORE_ROOT / "knowledge"
 CARDS_FILE = KNOWLEDGE_DIR / "cards.jsonl"
 INDEX_FILE = KNOWLEDGE_DIR / "index.json"
 VECTOR_INDEX_FILE = KNOWLEDGE_DIR / "index_vectors.npz"
+INDEX_META_FILE = KNOWLEDGE_DIR / "index_meta.json"
 RECS_FILE = STORE_ROOT / "recommendations.jsonl"
 SIGNALS_FILE = STORE_ROOT / "signals.jsonl"
 INDEX_MD = STORE_ROOT / "INDEX.md"
@@ -981,8 +982,53 @@ def compact() -> Dict:
     return {"before": before, "after": after, "removed": removed, "backup": str(backup_path)}
 
 
-def build_index():
+def check_index():
+    """检查索引退化状态"""
+    cards = _load_jsonl(CARDS_FILE)
+    active_cards = [c for c in cards if c.get("status") != "deprecated"]
+    card_count = sum(1 for c in cards if c.get("id", ""))
+    meta = _read_json(INDEX_META_FILE) if INDEX_META_FILE.exists() else {}
+    last_build_ts = meta.get("last_build_ts")
+    card_count_at_build = meta.get("card_count", 0)
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    age_days = None
+    if last_build_ts:
+        try:
+            age = now - _ts_to_dt(last_build_ts)
+            age_days = age.total_seconds() / 86400
+        except Exception:
+            age_days = None
+
+    index_exists = INDEX_FILE.exists()
+
+    reasons = []
+    if not index_exists:
+        reasons.append("索引文件不存在")
+    elif age_days is not None and age_days > 30:
+        reasons.append(f"索引距今 {age_days:.0f} 天（> 30 天阈值）")
+    if card_count_at_build > 0 and card_count > card_count_at_build * 1.2:
+        reasons.append(f"卡片数 {card_count} > 构建时 {card_count_at_build}（+{card_count - card_count_at_build}，超过 20% 阈值）")
+
+    needs_rebuild = len(reasons) > 0
+
+    return {
+        "index_exists": index_exists,
+        "age_days": round(age_days, 1) if age_days is not None else None,
+        "card_count": card_count,
+        "card_count_at_build": card_count_at_build,
+        "needs_rebuild": needs_rebuild,
+        "reasons": reasons,
+    }
+
+
+def build_index(auto: bool = False):
     """全量重建索引（TF-IDF + 向量）"""
+    if auto:
+        status = check_index()
+        if not status["needs_rebuild"]:
+            return {"action": "skipped", "reason": "索引健康，无需重建", "check": status}
+
     cards = _load_jsonl(CARDS_FILE)
     latest: Dict[str, Dict] = {}
     for c in cards:
@@ -1003,6 +1049,16 @@ def build_index():
     vidx = VectorIndex()
     active_cards = [c for c in latest.values() if c.get("status") != "deprecated"]
     n_vec = vidx.rebuild_from_cards(active_cards)
+
+    # 保存元数据
+    meta = {
+        "last_build_ts": iso_now(),
+        "card_count": len(latest),
+        "active_count": len(active_cards),
+        "tfidf_docs": len(idx.documents),
+        "vector_docs": n_vec,
+    }
+    _write_json(INDEX_META_FILE, meta)
 
     return {"tfidf_docs": len(idx.documents), "vector_docs": n_vec}
 
@@ -1581,7 +1637,11 @@ def main():
     p_sesslist.add_argument("--days", type=int, default=7)
 
     # build-index
-    sub.add_parser("build-index", help="全量重建索引")
+    p_bi = sub.add_parser("build-index", help="全量重建索引")
+    p_bi.add_argument("--auto", action="store_true", help="仅在索引退化时重建")
+
+    # check-index
+    sub.add_parser("check-index", help="检查索引健康状态")
 
     # compact
     sub.add_parser("compact", help="紧凑化 cards.jsonl，去除重复 ID 行")
@@ -1689,8 +1749,26 @@ def main():
             print(f"      任务: {s.get('task_summary','')[:80]}")
 
     elif args.command == "build-index":
-        n = build_index()
-        print(f"index rebuilt: TF-IDF={n['tfidf_docs']}, vector={n['vector_docs']} documents")
+        n = build_index(auto=args.auto)
+        if n.get("action") == "skipped":
+            print(f"[skip] 索引无需重建: {n['reason']}")
+        else:
+            print(f"index rebuilt: TF-IDF={n['tfidf_docs']}, vector={n['vector_docs']} documents")
+
+    elif args.command == "check-index":
+        status = check_index()
+        print(f"\n── 索引健康检查 ──")
+        print(f"  索引文件: {'存在' if status['index_exists'] else '不存在'}")
+        if status['age_days'] is not None:
+            print(f"  索引年龄: {status['age_days']} 天")
+        print(f"  当前卡片数: {status['card_count']}")
+        print(f"  构建时卡片数: {status['card_count_at_build']}")
+        if status['needs_rebuild']:
+            print(f"  状态: ❌ 需要重建")
+            for r in status['reasons']:
+                print(f"    - {r}")
+        else:
+            print(f"  状态: ✓ 健康")
 
     elif args.command == "compact":
         result = compact()
