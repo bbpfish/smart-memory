@@ -800,6 +800,18 @@ def signal(kind: str, card_id: str, context: str = ""):
         "card_id": card_id,
         "context": context
     })
+    # card_deprecated：更新卡片状态并标记废弃时间，不更新 retention
+    if kind == "card_deprecated":
+        cards = _load_jsonl(CARDS_FILE)
+        for c in reversed(cards):
+            if c.get("id") == card_id:
+                _append_jsonl(CARDS_FILE, {
+                    **c,
+                    "status": "deprecated",
+                    "deprecated_at": iso_now(),
+                })
+                break
+        return
     # 更新卡片权重 + retention（Ebbinghaus 遗忘曲线）
     weight_inc = {"card_used": 0.3, "card_reinforced": 0.5, "card_recalled": 0.1}.get(kind, 0.1)
     retention_inc = {"card_used": 0.5, "card_reinforced": 0.5, "card_recalled": 0.3}.get(kind, 0.3)
@@ -945,6 +957,120 @@ def harvest_from_text(text: str, auto_confirm: bool = False) -> List[Dict]:
         return results
 
     return unique
+
+
+def harvest_structured_from_text(text: str, auto_confirm: bool = False) -> List[Dict]:
+    """
+    从 LLM 预处理的结构化文本中直接提取知识卡片，跳过正则匹配。
+
+    输入格式（agent 输出，## 卡片 分隔）：
+        ## 卡片1
+        标题: <title>
+        何时使用: <when_to_use>
+        问题: <problem>
+        解决方案: <solution>
+        标签: <tag1>, <tag2>
+
+    输出：record() 的结果列表（auto_confirm=True）或候选卡片列表（auto_confirm=False）
+    """
+    cards = []
+    # 按 "## " 分割卡片块
+    blocks = re.split(r"\n##\s+", "\n" + text)
+    for block in blocks:
+        if not block.strip():
+            continue
+        # 跳过非卡片块（如 "## 总结" 等）
+        if not re.match(r"(卡片|经验|知识|记忆)", block.split("\n")[0].strip()):
+            continue
+
+        card = _parse_structured_card(block)
+        if card:
+            cards.append(card)
+
+    if auto_confirm:
+        results = []
+        for c in cards:
+            r = record(
+                title=c["title"],
+                when_to_use=c["when_to_use"],
+                problem=c["problem"],
+                solution_steps=c["solution_steps"],
+                tags=c["tags"],
+                scope=c.get("scope", "project"),
+            )
+            results.append({"title": c["title"][:60], "result": r})
+        return results
+
+    return cards
+
+
+def _parse_structured_card(block: str) -> Optional[Dict]:
+    """解析单个结构化卡片块，返回 card dict 或 None"""
+    lines = block.strip().split("\n")
+    # 第一行是标题行（如 "卡片1" 或 "经验2"），跳过
+
+    fields: Dict[str, Any] = {
+        "title": "",
+        "when_to_use": "",
+        "problem": "",
+        "solution_steps": [],
+        "tags": [],
+        "scope": "project",
+    }
+
+    current_field = None
+    buffer = []
+
+    for line in lines[1:]:  # 跳过标题行
+        stripped = line.strip()
+        m = re.match(r"^(标题|何时使用|问题|解决方案|标签)\s*[:：]\s*(.*)", stripped)
+        if m:
+            # 保存上一个字段
+            if current_field and buffer:
+                _set_card_field(fields, current_field, buffer)
+                buffer = []
+            current_field = m.group(1)
+            value = m.group(2).strip()
+            if value:
+                buffer.append(value)
+        elif stripped:
+            # 续行，追加到当前字段
+            buffer.append(stripped)
+
+    # 保存最后一个字段
+    if current_field and buffer:
+        _set_card_field(fields, current_field, buffer)
+
+    if not fields["title"]:
+        return None
+
+    return fields
+
+
+def _set_card_field(card: Dict, field: str, lines: List[str]) -> None:
+    """将多行 buffer 写入 card 对应字段"""
+    text = " ".join(lines).strip()
+    field_key = {
+        "标题": "title",
+        "何时使用": "when_to_use",
+        "问题": "problem",
+        "解决方案": "solution_steps",
+        "标签": "tags",
+    }.get(field)
+
+    if field_key == "title":
+        card["title"] = text
+    elif field_key == "when_to_use":
+        card["when_to_use"] = text
+    elif field_key == "problem":
+        card["problem"] = text
+    elif field_key == "solution_steps":
+        # 解决方案支持多行，每行一个步骤
+        card["solution_steps"] = lines
+    elif field_key == "tags":
+        # 按逗号或顿号或空格拆分
+        tags = re.split(r"[,，、\s]+", text)
+        card["tags"] = [t.strip() for t in tags if t.strip()][:8]
 
 
 def _extract_when(text: str, category: str) -> str:
@@ -1800,9 +1926,15 @@ def main():
     p_session.add_argument("--summary", default="", help="任务摘要")
 
     # harvest
-    p_harvest = sub.add_parser("harvest", help="从对话摘要自动提取知识卡片")
+    p_harvest = sub.add_parser("harvest", help="从对话摘要自动提取知识卡片（启发式正则）")
     p_harvest.add_argument("--text", required=True, help="对话摘要文本")
     p_harvest.add_argument("--auto-confirm", action="store_true", help="直接写入（跳过审查）")
+
+    # harvest-structured（方法1：LLM 预处理层）
+    p_hs = sub.add_parser("harvest-structured", help="从 LLM 预提取的结构化文本中直接入库")
+    p_hs.add_argument("--text", default="", help="结构化文本（## 卡片N 格式）")
+    p_hs.add_argument("--file", default="", help="从文件读取结构化文本")
+    p_hs.add_argument("--auto-confirm", action="store_true", help="直接写入（跳过审查）")
 
     # session-list
     p_sesslist = sub.add_parser("session-list", help="列出历史会话快照")
@@ -1917,6 +2049,27 @@ def main():
                 print(f"      触发: {c['when_to_use']}")
                 print(f"      标签: {', '.join(c.get('tags', []))}")
                 print(f"      原文: {c.get('_source_text', '')[:80]}...")
+                print()
+
+    elif args.command == "harvest-structured":
+        text = args.text
+        if args.file:
+            with open(args.file, "r", encoding="utf-8") as f:
+                text = f.read()
+        if not text:
+            print("错误: 需要提供 --text 或 --file")
+            sys.exit(1)
+        results = harvest_structured_from_text(text=text, auto_confirm=args.auto_confirm)
+        if args.auto_confirm:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+        else:
+            print(f"\n── 结构化收割候选 ({len(results)} 条) ──\n")
+            if not results:
+                print("  (未发现可提取的知识卡片)")
+            for i, c in enumerate(results, 1):
+                print(f"  [{i}] {c['title']}")
+                print(f"      触发: {c['when_to_use']}")
+                print(f"      标签: {', '.join(c.get('tags', []))}")
                 print()
 
     elif args.command == "session-list":

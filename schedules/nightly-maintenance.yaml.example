@@ -30,12 +30,27 @@ prompt: |-
   - use_skill(skill_name="smart-memory", task="recall：召回近期巡检经验 -q '夜间巡检 记忆优化 异常修复 代码改进 提示词修正' --top 5 --days 14")
   - 记录执行前 cards.jsonl 行数和唯一 ID 数
 
-  ## 第 1 步：数据收割
-  前置条件：检查 signals.jsonl 最近 48 小时有 card_recorded 信号则执行，否则跳过
-  - 读 signals.jsonl 提取最近 48 小时的 card_recorded 信号（含对话摘要）
-  - 若 signals 不含对话摘要，则跳过 harvest
-  - use_skill(skill_name="smart-memory", task="harvest：批量收割对话摘要 --text '<摘要>' --auto-confirm")
-  - 输出：扫描 X 条信号、Y 条含摘要、新增 Z 张卡片
+  ## 第 1 步：数据收割（LLM 结构化，方法1）
+  前置条件：检查 messages 表最近 48 小时有新数据则执行，否则跳过
+  - 读 data.db messages 表（最近 48 小时 role=user/assistant）
+  - 按 conversation_id 分组，对各组对话摘要做结构化知识提取，输出以下格式：
+
+    ```
+    ## 卡片1
+    标题: <一句话标题>
+    何时使用: <触发条件>
+    问题: <遇到的具体问题>
+    解决方案: <解决步骤>
+    标签: <tag1>, <tag2>
+
+    ## 卡片2
+    ...
+    ```
+
+    提取标准：可复用的规律、配置陷阱、有效操作模式、代码缺陷修复；跳过纯查询/只读操作。
+  - 将结构化文本写入 temp/harvest_structured.md
+  - use_skill(skill_name="smart-memory", task="harvest-structured：LLM结构化收割 --file 'temp/harvest_structured.md' --auto-confirm")
+  - 输出：扫描 X 条消息、Y 个会话、新增 Z 张卡片
 
   ## 第 2 步：数据探查
   前置条件：始终执行
@@ -48,13 +63,10 @@ prompt: |-
 
   ## 第 3 步：遗忘曲线巡检
   前置条件：始终执行
-  - use_skill(skill_name="smart-memory", task="decay-report：对比 baseline 与当前 retention，检测衰减")
-  - 结果解读：
-    * baseline_age_hours < 12 → 跳过（距上次 recalc-decay 不足半天，衰减无意义）
-    * total_decayed > 0 → 告警：衰减卡片详情（ID、基线保留率、当前保留率、下降幅度、最后使用时间）
-    * total_decayed = 0 且 baseline_age_hours > 48 → 标注「48h 零衰减」，卡片生态稳定
-    * 若返回 error "no_baseline" → 首次运行，输出当前 retention 分布供人工审视，跳过衰减对比
-  - 输出遗忘仪表盘：衰减候选数、最大衰减幅度、当前保留率分布
+  - retention < 0.1 且 30 天无信号 → 待废弃候选
+  - importance > 0.7 且 retention < 0.3 → 高价值遗忘警报
+  - 按 importance 分段统计 retention 均值，检测任一段是否较上日下降 >20%
+  - 输出遗忘仪表盘
 
   ## 第 4 步：异常检测 + 自动修复（Reflexion 模式）
   前置条件：始终执行
@@ -119,11 +131,11 @@ prompt: |-
   - use_skill(skill_name="smart-memory", task="cross-link：向量相似度发现跨卡隐藏关联 --threshold 0.35 --top-k 5 --auto-write")
   - 输出：新增关联数
 
-  10.3 信号分析 + retention & importance 重算：
+  10.3 信号分析 + importance 重算：
   - use_skill(skill_name="smart-memory", task="signal-analysis：基于30天信号数据更新成熟度评分 --days 30 --auto-write")
-  - use_skill(skill_name="smart-memory", task="recalc-decay：批量更新所有卡片的 retention（遗忘曲线）和 importance --save-baseline")
-  - use_skill(skill_name="smart-memory", task="compact：压缩 cards.jsonl 去除 recalc-decay 产生的重复行")
-  - 输出：retention 更新数、importance 更新数、baseline 保存状态
+  - 先预览：use_skill(skill_name="smart-memory", task="recalc-importance：基于信号批量重算importance --dry-run")
+  - 确认合理后执行：use_skill(skill_name="smart-memory", task="recalc-importance：批量重算所有卡片importance")
+  - 输出：更新卡片数、importance 分布变化
 
   10.4 成熟度报告：
   - use_skill(skill_name="smart-memory", task="maturity：知识成熟度报告 --limit 50")
@@ -168,13 +180,6 @@ prompt: |-
   - 更新 last_modified_time 为当前时间
   - 不修改 task_id / created_time / from_conversation_id / status
   - 输出：本次修正 M 处不匹配，prompt 已自动同步
-
-  12.4 ClawdHub 发布同步：
-  前置条件：本次 12.3 对 prompt 做了修正（M > 0）时执行；否则跳过
-  - 检查技能目录 SKILL.md 版本号 vs ClawdHub 市场版本（`npx clawhub info <slug>`）
-  - 若本地版本 > 市场版本 或 版本相同但代码有变更 → bump 版本号 → `npx clawhub publish` → Git 提交推送
-  - 发布后同步更新本模板文件
-  - 输出：ClawdHub 同步状态（已同步/已发布 vX.Y.Z / 跳过）
 
   ## 第 13 步：产出报告
   写入 output/nightly_maintenance_report.md：
