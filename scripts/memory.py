@@ -314,6 +314,8 @@ def record(title: str, when_to_use: str, problem: str,
         "weight": 1.0,
         "reinforced_count": 0,
         "status": "active",
+        "retention": 1.0,
+        "importance": 0.5,
     }
     # Merge kwargs keys not already in card
     for k, v in kwargs.items():
@@ -345,21 +347,44 @@ def record(title: str, when_to_use: str, problem: str,
     return {"id": card_id, "action": "created", "weight": 1.0}
 
 
+def _ebbinghaus_decay(card: Dict, now: _dt.datetime) -> float:
+    """Ebbinghaus 遗忘曲线衰减：R(t) = R₀ × e^(-t/S)"""
+    last = card.get("last_used_ts") or card.get("ts", iso_now())
+    try:
+        hours = (now - _ts_to_dt(last)).total_seconds() / 3600.0
+    except Exception:
+        hours = 0.0
+    importance = card.get("importance", 0.5)
+    S = importance * 720.0  # max half-life ~30 days at importance=1.0
+    current_retention = card.get("retention", 1.0)
+    decayed = current_retention * math.exp(-hours / max(S, 1.0))
+    return round(max(0.01, decayed), 4)
+
+
 def signal(kind: str, card_id: str, context: str = ""):
-    """记录使用信号"""
+    """记录使用信号，同时更新 Ebbinghaus 遗忘曲线 retention"""
     _append_jsonl(SIGNALS_FILE, {
         "ts": iso_now(),
         "kind": kind,
         "card_id": card_id,
         "context": context
     })
-    # 更新卡片权重
+    # 更新卡片权重 + retention（Ebbinghaus 遗忘曲线）
     weight_inc = {"card_used": 0.3, "card_reinforced": 0.5, "card_recalled": 0.1}.get(kind, 0.1)
+    retention_inc = {"card_used": 0.5, "card_reinforced": 0.5, "card_recalled": 0.3}.get(kind, 0.3)
     cards = _load_jsonl(CARDS_FILE)
+    now = _dt.datetime.now(_dt.timezone.utc)
     for c in reversed(cards):
         if c.get("id") == card_id:
+            decayed = _ebbinghaus_decay(c, now)
+            new_retention = round(min(1.0, decayed + retention_inc), 4)
             new_w = round(c.get("weight", 1.0) + weight_inc, 2)
-            _append_jsonl(CARDS_FILE, {**c, "weight": new_w, "last_used_ts": iso_now()})
+            _append_jsonl(CARDS_FILE, {
+                **c,
+                "weight": new_w,
+                "last_used_ts": iso_now(),
+                "retention": new_retention,
+            })
             break
 
 
@@ -805,6 +830,7 @@ def main():
     p_record.add_argument("--tags", nargs="*", default=[], help="标签")
     p_record.add_argument("--gotchas", nargs="*", default=[], help="坑点")
     p_record.add_argument("--scope", default="project")
+    p_record.add_argument("--importance", type=float, default=0.5, help="重要性 (0.0~1.0), 影响遗忘曲线衰减速度")
 
     # signal
     p_signal = sub.add_parser("signal", help="记录使用信号")
@@ -865,7 +891,8 @@ def main():
         result = record(
             title=args.title, when_to_use=args.when, problem=args.problem,
             solution_steps=args.solution, evidence=args.evidence,
-            tags=args.tags, gotchas=args.gotchas, scope=args.scope
+            tags=args.tags, gotchas=args.gotchas, scope=args.scope,
+            importance=args.importance,
         )
         print(json.dumps(result, ensure_ascii=False))
 
