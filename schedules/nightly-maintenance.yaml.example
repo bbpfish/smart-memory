@@ -48,7 +48,14 @@ prompt: |-
     ```
 
     提取标准：可复用的规律、配置陷阱、有效操作模式、代码缺陷修复；跳过纯查询/只读操作。
-  - 将结构化文本写入 temp/harvest_structured.md
+
+  - **质量门（方法3增强）**：写入文件后，逐卡片自审：
+    a) 这条经验是否可跨会话复用？（非本次对话临时上下文）
+    b) 如果没有记忆系统，下次遇到同类问题是否会后悔没记下来？
+    c) 是否只是流程记录（"用户要求做X，我做了Y"）而非通用知识？
+    淘汰标准：任一答案为"否"或"只是流程记录" → 从文件中删除该卡片。
+    目的：宁可漏割 2 条，不污染 1 条。
+
   - use_skill(skill_name="smart-memory", task="harvest-structured：LLM结构化收割 --file 'temp/harvest_structured.md' --auto-confirm")
   - 输出：扫描 X 条消息、Y 个会话、新增 Z 张卡片
 
