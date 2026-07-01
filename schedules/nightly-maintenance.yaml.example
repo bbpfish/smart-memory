@@ -31,11 +31,11 @@ prompt: |-
   - 记录执行前 cards.jsonl 行数和唯一 ID 数
 
   ## 第 1 步：数据收割
-  前置条件：检查 messages 表最近 48 小时有新数据则执行，否则跳过
-  - 读 data.db messages 表（最近 48 小时 role=user/assistant）
-  - 按 conversation_id 分组提取可复用经验摘要
+  前置条件：检查 signals.jsonl 最近 48 小时有 card_recorded 信号则执行，否则跳过
+  - 读 signals.jsonl 提取最近 48 小时的 card_recorded 信号（含对话摘要）
+  - 若 signals 不含对话摘要，则跳过 harvest
   - use_skill(skill_name="smart-memory", task="harvest：批量收割对话摘要 --text '<摘要>' --auto-confirm")
-  - 输出：扫描 X 条消息、Y 个会话、新增 Z 张卡片
+  - 输出：扫描 X 条信号、Y 条含摘要、新增 Z 张卡片
 
   ## 第 2 步：数据探查
   前置条件：始终执行
@@ -119,6 +119,7 @@ prompt: |-
   10.3 信号分析 + retention & importance 重算：
   - use_skill(skill_name="smart-memory", task="signal-analysis：基于30天信号数据更新成熟度评分 --days 30 --auto-write")
   - use_skill(skill_name="smart-memory", task="recalc-decay：批量更新所有卡片的 retention（遗忘曲线）和 importance")
+  - use_skill(skill_name="smart-memory", task="compact：压缩 cards.jsonl 去除 recalc-decay 产生的重复行")
   - 输出：retention 更新数、importance 更新数、分布变化
 
   10.4 成熟度报告：
