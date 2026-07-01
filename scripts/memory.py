@@ -332,11 +332,34 @@ class VectorIndex:
 
 # ── 核心操作 ──────────────────────────────────────────
 
+def _get_retention_params(card: Dict) -> Tuple[float, float]:
+    """计算卡片的 retention 参数：(半衰期_天, 分数乘数)
+
+    固化卡片获得更慢衰减和更高基础权重。
+
+    分级规则:
+      - 合成卡片 (_synthesis_of 存在)  → 半衰期 60 天, 2.0x
+      - 成熟度 >= 0.85                   → 半衰期 60 天, 2.0x
+      - 成熟度 >= 0.70                   → 半衰期 45 天, 1.5x
+      - 默认                            → 半衰期 30 天, 1.0x
+    """
+    # 合成卡片优先
+    if card.get("_synthesis_of"):
+        return 60.0, 2.0
+    ms = card.get("maturity_score", 0)
+    if ms >= 0.85:
+        return 60.0, 2.0
+    if ms >= 0.70:
+        return 45.0, 1.5
+    return 30.0, 1.0
+
+
 def recall(query: str = "", tags: List[str] = None, top_k: int = 10,
            days: int = 30, mode: str = "hybrid") -> List[Dict]:
     """
-    任务前召回：TF-IDF 匹配 + 向量语义检索 + 标签过滤 + 时间衰减
+    任务前召回：TF-IDF 匹配 + 向量语义检索 + 标签过滤 + 差异化时间衰减
 
+    固化卡片（合成卡 / 高成熟度）获得更长半衰期和更高权重基数。
     mode: "tfidf" | "vector" | "hybrid"（默认 hybrid）
     """
     cards_all = _load_jsonl(CARDS_FILE)
@@ -397,9 +420,10 @@ def recall(query: str = "", tags: List[str] = None, top_k: int = 10,
             age_days = (now - _ts_to_dt(ts)).days
         except Exception:
             age_days = 0
-        # 衰减因子：30天半衰期
-        decay = 0.5 ** (age_days / 30.0)
-        final_score = score * decay
+        # 差异化衰减：固化卡片获得更长半衰期和权重加成
+        half_life, boost = _get_retention_params(card)
+        decay = 0.5 ** (age_days / half_life)
+        final_score = score * boost * decay
 
         # 去重：相似 title
         title_key = card.get("title", "").strip().lower()[:20]
@@ -1045,6 +1069,459 @@ def migrate_from_selflearning():
     return {"migrated_cards": migrated, "skipped": skipped, "indexed": n_indexed}
 
 
+# ══════════════════════════════════════════════════════
+# P3: 轻量版「炼知识」— 聚类合成 / 跨卡关联 / 信号分析 / 成熟度评分
+# ══════════════════════════════════════════════════════
+
+def _get_active_cards() -> Dict[str, Dict]:
+    """获取所有活跃卡片（最新版本，排除 deprecated 和已合成卡片）"""
+    cards = _load_jsonl(CARDS_FILE)
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid:
+            latest[cid] = c
+    return {cid: c for cid, c in latest.items()
+            if c.get("status") not in ("deprecated", "synthesized")}
+
+
+def synthesize(threshold: float = 0.6, min_cluster_size: int = 2,
+               auto_write: bool = False) -> Dict:
+    """聚类相似卡片并生成知识合成卡片。
+
+    使用向量语义相似度对活跃卡片进行贪心聚类，
+    对满足最小簇大小的簇生成一张合成卡片，包含合并的
+    解决方案、标签和触发条件。源卡片标记为 synthesized 状态。
+
+    返回: {"clusters": N, "synthesis_cards": [...]}
+    """
+    active = _get_active_cards()
+    if len(active) < min_cluster_size:
+        return {"clusters": 0, "synthesis_cards": [], "note": f"活跃卡片不足 ({len(active)} < {min_cluster_size})"}
+
+    # 嵌入所有活跃卡片
+    card_ids = list(active.keys())
+    texts = [VectorIndex._build_text(active[cid]) for cid in card_ids]
+    vidx = VectorIndex()
+    vectors = vidx._embed(texts)
+
+    # 计算余弦相似度矩阵
+    sim_matrix = np.dot(vectors, vectors.T)
+
+    # 贪心聚类：按 weight 降序，未聚类的卡片依次作为种子
+    order = sorted(range(len(card_ids)), key=lambda i: -active[card_ids[i]].get("weight", 1.0))
+    clustered: set = set()
+    clusters: List[List[Tuple[str, float]]] = []
+
+    for i in order:
+        cid = card_ids[i]
+        if cid in clustered:
+            continue
+        members: List[Tuple[str, float]] = [(cid, 1.0)]
+        for j in range(len(card_ids)):
+            if i == j:
+                continue
+            cid2 = card_ids[j]
+            if cid2 in clustered:
+                continue
+            sim = float(sim_matrix[i, j])
+            if sim >= threshold:
+                members.append((cid2, sim))
+        if len(members) >= min_cluster_size:
+            clusters.append(members)
+            for mid, _ in members:
+                clustered.add(mid)
+
+    synthesis_cards = []
+    for members in clusters:
+        source_ids = [m[0] for m in members]
+        source_cards = [active[cid] for cid in source_ids]
+
+        # 收集所有标签，规范化（修复逗号分隔字符串为一个标签的旧数据），取出现频率最高的
+        all_tags: List[str] = []
+        for c in source_cards:
+            for t in c.get("tags", []):
+                if isinstance(t, str) and "," in t and len(t) > 20:
+                    # 修复旧数据：逗号分隔字符串 → 拆分为独立标签
+                    all_tags.extend(part.strip() for part in t.split(",") if part.strip())
+                else:
+                    all_tags.append(t)
+        tag_counter = Counter(all_tags)
+        top_tags = [t for t, _ in tag_counter.most_common(5)]
+
+        # 生成合成标题
+        if top_tags:
+            syn_title = "知识簇: " + ", ".join(top_tags[:3])
+        else:
+            syn_title = "知识合成: " + source_cards[0].get("title", "")[:40]
+        if len(syn_title) > 80:
+            syn_title = syn_title[:77] + "..."
+
+        # 合并 when_to_use
+        all_when = []
+        for c in source_cards:
+            w = c.get("when_to_use", "").strip()
+            if w and w not in all_when:
+                all_when.append(w)
+
+        # 合并问题描述
+        problems = []
+        for c in source_cards:
+            p = c.get("problem", "").strip()
+            if p and p not in problems:
+                problems.append(p)
+
+        # 合并解决方案（去重）
+        solutions: List[str] = []
+        seen_sol = set()
+        for c in source_cards:
+            for s in c.get("solution_steps", []):
+                key = s.strip()[:60]
+                if key and key not in seen_sol:
+                    seen_sol.add(key)
+                    solutions.append(s.strip())
+
+        # 收集证据
+        evidence_all: List[str] = []
+        for c in source_cards:
+            for e in c.get("evidence", []):
+                if e.strip() and e.strip() not in evidence_all:
+                    evidence_all.append(e.strip())
+
+        # 收集坑点
+        gotchas_all: List[str] = []
+        for c in source_cards:
+            for g in c.get("gotchas", []):
+                if g.strip() and g.strip() not in gotchas_all:
+                    gotchas_all.append(g.strip())
+
+        syn_card: Dict[str, Any] = {
+            "title": syn_title,
+            "when_to_use": " ; ".join(all_when[:3]),
+            "problem": " ; ".join(problems[:5]),
+            "solution_steps": solutions[:10],
+            "evidence": evidence_all[:5],
+            "tags": top_tags,
+            "gotchas": gotchas_all[:5],
+            "scope": source_cards[0].get("scope", "project"),
+            "importance": max(c.get("importance", 0.5) for c in source_cards),
+            "_synthesis_of": source_ids,
+            "_source_count": len(source_ids),
+            "status": "active",
+        }
+
+        synthesis_info = {
+            "id": "",
+            "title": syn_title,
+            "source_count": len(source_ids),
+            "source_ids": source_ids,
+            "top_tags": top_tags,
+        }
+
+        if auto_write:
+            syn_id = _hash_id(syn_title + "".join(sorted(source_ids)), "sm")
+            syn_card["id"] = syn_id
+            syn_card["weight"] = round(1.0 + math.log(len(source_ids) + 1), 3)
+            syn_card["reinforced_count"] = 0
+            _append_jsonl(CARDS_FILE, syn_card)
+            synthesis_info["id"] = syn_id
+
+            # 标记源卡片为已合成
+            for cid in source_ids:
+                updated = dict(active[cid])
+                updated["status"] = "synthesized"
+                updated["_synthesized_into"] = syn_id
+                _append_jsonl(CARDS_FILE, updated)
+
+            signal("card_recorded", syn_id, context=f"synthesized from {len(source_ids)} cards")
+
+        synthesis_cards.append(synthesis_info)
+
+    return {"clusters": len(clusters), "synthesis_cards": synthesis_cards}
+
+
+def cross_link(threshold: float = 0.5, top_k: int = 3,
+               auto_write: bool = False) -> Dict:
+    """基于向量相似度发现跨卡片关联并建立双向链接。
+
+    对每张活跃卡片找到 top_k 张最相似的非自身卡片，
+    添加或更新 _related 字段（双向链接）。
+
+    返回: {"new_links": N, "cards_affected": N, "links": [...]}
+    """
+    active = _get_active_cards()
+    if len(active) < 2:
+        return {"new_links": 0, "cards_affected": 0, "note": "活跃卡片不足"}
+
+    card_ids = list(active.keys())
+    texts = [VectorIndex._build_text(active[cid]) for cid in card_ids]
+    vidx = VectorIndex()
+    vectors = vidx._embed(texts)
+    sim_matrix = np.dot(vectors, vectors.T)
+
+    # 收集已有链接（避免重复）
+    existing_links: Dict[str, set] = {}
+    for cid, c in active.items():
+        existing_links[cid] = set()
+        for rel in c.get("_related", []):
+            if isinstance(rel, dict):
+                existing_links[cid].add(rel.get("id", ""))
+            elif isinstance(rel, str):
+                existing_links[cid].add(rel)
+        # 合成关系也算已有链接
+        if c.get("_synthesis_of"):
+            for sid in c["_synthesis_of"]:
+                existing_links[cid].add(sid)
+        if c.get("_synthesized_into"):
+            existing_links[cid].add(c["_synthesized_into"])
+
+    # 为每张卡片找 top_k 最相似卡片
+    new_links = 0
+    cards_updated: Dict[str, Dict] = {}
+    links_detail: List[Dict] = []
+
+    for i, cid in enumerate(card_ids):
+        # 取相似度最高的 top_k + 1 个（跳过自身）
+        sims = [(j, float(sim_matrix[i, j])) for j in range(len(card_ids)) if i != j]
+        sims.sort(key=lambda x: -x[1])
+        top_sims = sims[:top_k]
+
+        new_related = []
+        for j, sim in top_sims:
+            if sim < threshold:
+                break
+            target_id = card_ids[j]
+            if target_id in existing_links.get(cid, set()):
+                continue
+            new_related.append({"id": target_id, "_similarity": round(sim, 4)})
+            # 双向建立
+            if target_id not in cards_updated:
+                cards_updated[target_id] = dict(active[target_id])
+            target_existing = cards_updated[target_id].setdefault("_related", [])
+            target_existing_ids = {r.get("id", r) if isinstance(r, dict) else r for r in target_existing}
+            if cid not in target_existing_ids:
+                target_existing.append({"id": cid, "_similarity": round(sim, 4)})
+
+        if new_related:
+            if cid not in cards_updated:
+                cards_updated[cid] = dict(active[cid])
+            existing_rel = cards_updated[cid].get("_related", [])
+            if isinstance(existing_rel, list):
+                cards_updated[cid]["_related"] = existing_rel + new_related
+            else:
+                cards_updated[cid]["_related"] = new_related
+            new_links += len(new_related)
+            for nr in new_related:
+                links_detail.append({
+                    "from": cid, "to": nr["id"],
+                    "similarity": nr["_similarity"],
+                })
+
+    if auto_write and cards_updated:
+        for cid, updated in cards_updated.items():
+            _append_jsonl(CARDS_FILE, updated)
+
+    return {
+        "new_links": new_links,
+        "cards_affected": len(cards_updated),
+        "links": links_detail,
+    }
+
+
+def calculate_maturity(card: Dict, signals_data: List[Dict],
+                       days: int = 30) -> float:
+    """计算单张卡片的知识成熟度评分 (0.0~1.0)。
+
+    公式:
+      signal_score (0.5): min(total_signals / 10, 1.0) 的信号活跃度
+      completeness (0.3): 字段完整性评分
+      importance  (0.2): 卡片重要性
+    """
+    cid = card.get("id", "")
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    # 信号活跃度
+    total_signals = 0
+    for s in signals_data:
+        if s.get("card_id") != cid:
+            continue
+        try:
+            st = _ts_to_dt(s.get("ts", ""))
+            if (now - st).days <= days:
+                total_signals += 1
+        except Exception:
+            continue
+    signal_score = min(total_signals / 10.0, 1.0)
+
+    # 字段完整性
+    checks = [
+        bool(card.get("problem", "").strip()),
+        bool(card.get("solution_steps")),
+        bool(card.get("evidence")),
+        bool(card.get("gotchas")),
+        bool(card.get("tags")),
+    ]
+    completeness = sum(checks) / len(checks)
+
+    # 重要性
+    importance = card.get("importance", 0.5)
+
+    maturity = signal_score * 0.5 + completeness * 0.3 + importance * 0.2
+    return round(min(maturity, 1.0), 4)
+
+
+def signal_analysis(days: int = 30, auto_write: bool = False) -> Dict:
+    """分析使用信号，更新卡片成熟度评分。
+
+    加载最近 days 天内的所有信号，为每张活跃卡片计算成熟度评分，
+    写入 cards.jsonl 的 maturity_score 字段。
+
+    同时识别：
+      - high_recall: 召回频繁的卡片（top 20%）
+      - zero_recall: 从未被召回的卡片
+      - rising: 最近 7 天有新增召回活动的卡片
+
+    返回: 分析摘要
+    """
+    signals = _load_jsonl(SIGNALS_FILE)
+    cards = _load_jsonl(CARDS_FILE)
+
+    # 取最新版卡片
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid:
+            latest[cid] = c
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    # 计算每张活跃卡片的成熟度
+    maturity_updates: Dict[str, float] = {}
+    recall_counts: Dict[str, int] = {}
+
+    for cid, c in latest.items():
+        if c.get("status") in ("deprecated",):
+            continue
+        m = calculate_maturity(c, signals, days=days)
+        maturity_updates[cid] = m
+
+        # 统计召回次数
+        cnt = 0
+        for s in signals:
+            if s.get("card_id") == cid and s.get("kind") == "card_recalled":
+                try:
+                    st = _ts_to_dt(s.get("ts", ""))
+                    if (now - st).days <= days:
+                        cnt += 1
+                except Exception:
+                    continue
+        recall_counts[cid] = cnt
+
+    # 识别分组
+    if recall_counts:
+        max_recall = max(recall_counts.values())
+        high_threshold = max(max_recall * 0.3, 2)  # top 30% 或至少 2 次
+    else:
+        high_threshold = 2
+
+    high_recall = [cid for cid, cnt in recall_counts.items() if cnt >= high_threshold]
+    zero_recall = [cid for cid, cnt in recall_counts.items() if cnt == 0]
+    # rising: 最近 7 天有召回
+    rising = []
+    for cid in recall_counts:
+        recent = 0
+        for s in signals:
+            if s.get("card_id") == cid and s.get("kind") == "card_recalled":
+                try:
+                    st = _ts_to_dt(s.get("ts", ""))
+                    if (now - st).days <= 7:
+                        recent += 1
+                except Exception:
+                    continue
+        if recent > 0 and recall_counts.get(cid, 0) <= recent * 2:
+            rising.append(cid)
+
+    # 写入
+    if auto_write:
+        for cid, m in maturity_updates.items():
+            old_m = latest[cid].get("maturity_score", -1)
+            if abs(old_m - m) >= 0.001:
+                updated = dict(latest[cid])
+                updated["maturity_score"] = m
+                _append_jsonl(CARDS_FILE, updated)
+
+    return {
+        "cards_analyzed": len(maturity_updates),
+        "maturity_avg": round(sum(maturity_updates.values()) / max(len(maturity_updates), 1), 4),
+        "high_recall_count": len(high_recall),
+        "zero_recall_count": len(zero_recall),
+        "rising_count": len(rising),
+        "high_recall_ids": high_recall[:20],
+        "zero_recall_ids": zero_recall[:20],
+        "rising_ids": rising[:20],
+    }
+
+
+def maturity_report(limit: int = 50) -> Dict:
+    """生成知识成熟度报告。
+
+    返回按成熟度评分排序的卡片列表，含评级。
+    """
+    cards = _load_jsonl(CARDS_FILE)
+    latest: Dict[str, Dict] = {}
+    for c in cards:
+        cid = c.get("id", "")
+        if cid and c.get("status") != "deprecated":
+            latest[cid] = c
+
+    signals = _load_jsonl(SIGNALS_FILE)
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    ranked = []
+    for cid, c in latest.items():
+        m_score = c.get("maturity_score", 0)
+        if m_score == 0:
+            m_score = calculate_maturity(c, signals)
+        # 评级
+        if m_score >= 0.7:
+            grade = "A"
+        elif m_score >= 0.5:
+            grade = "B"
+        elif m_score >= 0.3:
+            grade = "C"
+        else:
+            grade = "D"
+
+        # 计算年龄
+        ts = c.get("ts", "")
+        try:
+            age = (now - _ts_to_dt(ts)).days
+        except Exception:
+            age = -1
+
+        ranked.append({
+            "id": cid,
+            "title": c.get("title", "")[:60],
+            "maturity": m_score,
+            "grade": grade,
+            "age_days": age,
+            "tags": c.get("tags", [])[:5],
+            "status": c.get("status", ""),
+        })
+
+    ranked.sort(key=lambda x: -x["maturity"])
+    return {
+        "total": len(ranked),
+        "by_grade": {
+            "A": sum(1 for r in ranked if r["grade"] == "A"),
+            "B": sum(1 for r in ranked if r["grade"] == "B"),
+            "C": sum(1 for r in ranked if r["grade"] == "C"),
+            "D": sum(1 for r in ranked if r["grade"] == "D"),
+        },
+        "cards": ranked[:limit],
+    }
+
+
 # ── CLI ──────────────────────────────────────────────
 
 def main():
@@ -1115,6 +1592,27 @@ def main():
     # recalc-importance
     p_recalc = sub.add_parser("recalc-importance", help="基于信号数据批量重算所有卡片的 importance")
     p_recalc.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+
+    # synthesize
+    p_syn = sub.add_parser("synthesize", help="聚类相似卡片并生成知识合成卡片")
+    p_syn.add_argument("--threshold", type=float, default=0.6, help="相似度阈值 (0.0~1.0)")
+    p_syn.add_argument("--min-cluster-size", type=int, default=2, help="最小簇大小")
+    p_syn.add_argument("--auto-write", action="store_true", help="自动写入结果")
+
+    # cross-link
+    p_xlink = sub.add_parser("cross-link", help="基于向量相似度发现跨卡片关联")
+    p_xlink.add_argument("--threshold", type=float, default=0.5, help="关联相似度阈值")
+    p_xlink.add_argument("--top-k", type=int, default=3, help="每张卡片最多关联数")
+    p_xlink.add_argument("--auto-write", action="store_true", help="自动写入结果")
+
+    # signal-analysis
+    p_sig = sub.add_parser("signal-analysis", help="分析信号数据并更新成熟度评分")
+    p_sig.add_argument("--days", type=int, default=30, help="分析时间范围（天）")
+    p_sig.add_argument("--auto-write", action="store_true", help="自动写入 maturity_score")
+
+    # maturity
+    p_mat = sub.add_parser("maturity", help="知识成熟度报告")
+    p_mat.add_argument("--limit", type=int, default=50, help="最多返回卡片数")
 
     args = parser.parse_args()
 
@@ -1228,6 +1726,59 @@ def main():
             print(f"      {old:.2f} → {new:.2f}")
         if args.dry_run:
             print(f"\n[dry-run] 以上 {len(updated)} 张卡片未实际写入")
+
+    elif args.command == "synthesize":
+        result = synthesize(threshold=args.threshold,
+                            min_cluster_size=args.min_cluster_size,
+                            auto_write=args.auto_write)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if result.get("synthesis_cards") else
+              f"\n── 知识合成 ──\n{result.get('note', '')}")
+        if result.get("synthesis_cards"):
+            print(f"\n共发现 {result['clusters']} 个知识簇，{len(result['synthesis_cards'])} 张合成卡片：")
+            for sc in result["synthesis_cards"]:
+                print(f"  [{sc['id']}] {sc['title'][:60]}")
+                print(f"      来源: {sc['source_count']} 张卡片 | 标签: {', '.join(sc['top_tags'][:3])}")
+                if not args.auto_write:
+                    print(f"      (预览模式，加 --auto-write 写入)")
+                print()
+
+    elif args.command == "cross-link":
+        result = cross_link(threshold=args.threshold, top_k=args.top_k,
+                            auto_write=args.auto_write)
+        print(json.dumps(result, ensure_ascii=False, indent=2) if result.get("links") else
+              f"\n── 跨卡关联 ──\n{result.get('note', '')}")
+        if result.get("links"):
+            print(f"\n新增 {result['new_links']} 条关联，涉及 {result['cards_affected']} 张卡片：")
+            for link in result["links"][:20]:
+                print(f"  {link['from'][:16]} ←→ {link['to'][:16]}  (sim={link['similarity']:.3f})")
+            if len(result["links"]) > 20:
+                print(f"  ... 共 {len(result['links'])} 条")
+            if not args.auto_write:
+                print(f"\n(预览模式，加 --auto-write 写入)")
+
+    elif args.command == "signal-analysis":
+        result = signal_analysis(days=args.days, auto_write=args.auto_write)
+        print(f"\n── 信号分析 (days={args.days}) ──")
+        print(f"分析卡片: {result['cards_analyzed']} 张")
+        print(f"平均成熟度: {result['maturity_avg']:.2f}")
+        print(f"高频召回: {result['high_recall_count']} 张")
+        print(f"零召回:   {result['zero_recall_count']} 张")
+        print(f"上升趋势: {result['rising_count']} 张")
+        if not args.auto_write:
+            print(f"\n(预览模式，加 --auto-write 写入 maturity_score)")
+
+    elif args.command == "maturity":
+        result = maturity_report(limit=args.limit)
+        print(f"\n── 知识成熟度报告 (共 {result['total']} 张) ──")
+        print(f"评级分布: A={result['by_grade']['A']}  B={result['by_grade']['B']}  "
+              f"C={result['by_grade']['C']}  D={result['by_grade']['D']}")
+        print()
+        if not result["cards"]:
+            print("  (无卡片)")
+        for i, c in enumerate(result["cards"], 1):
+            print(f"  [{i}] [{c['grade']}] [{c['maturity']:.2f}] {c['title'][:50]}")
+            print(f"      年龄: {c['age_days']}d  |  标签: {', '.join(c['tags'][:3])}")
+            print()
 
     else:
         parser.print_help()
