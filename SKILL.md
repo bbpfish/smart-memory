@@ -1,6 +1,6 @@
 ---
 name: smart-memory
-version: 2.2.0
+version: 2.2.2
 description: 分层长期记忆管理系统：任务前自动 TF-IDF 召回相关记忆，任务后持久化知识卡片，支持语义去重、时间衰减权重、全量索引重建，可从 self-learning-skills 一键迁移历史数据。
 ---
 
