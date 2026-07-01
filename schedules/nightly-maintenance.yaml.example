@@ -116,11 +116,10 @@ prompt: |-
   - use_skill(skill_name="smart-memory", task="cross-link：向量相似度发现跨卡隐藏关联 --threshold 0.35 --top-k 5 --auto-write")
   - 输出：新增关联数
 
-  10.3 信号分析 + importance 重算：
+  10.3 信号分析 + retention & importance 重算：
   - use_skill(skill_name="smart-memory", task="signal-analysis：基于30天信号数据更新成熟度评分 --days 30 --auto-write")
-  - 先预览：use_skill(skill_name="smart-memory", task="recalc-importance：基于信号批量重算importance --dry-run")
-  - 确认合理后执行：use_skill(skill_name="smart-memory", task="recalc-importance：批量重算所有卡片importance")
-  - 输出：更新卡片数、importance 分布变化
+  - use_skill(skill_name="smart-memory", task="recalc-decay：批量更新所有卡片的 retention（遗忘曲线）和 importance")
+  - 输出：retention 更新数、importance 更新数、分布变化
 
   10.4 成熟度报告：
   - use_skill(skill_name="smart-memory", task="maturity：知识成熟度报告 --limit 50")
