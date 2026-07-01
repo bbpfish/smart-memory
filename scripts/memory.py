@@ -362,6 +362,16 @@ def _ebbinghaus_decay(card: Dict, now: _dt.datetime) -> float:
     return round(max(0.01, decayed), 4)
 
 
+def _calc_importance(card: Dict) -> float:
+    """自动计算重要性（0~1）：基于 reinforced_count + weight + retention"""
+    rc = card.get("reinforced_count", 0)
+    w = card.get("weight", 1.0)
+    r = card.get("retention", 1.0)
+    # reinforced_count 贡献 0.5，weight 贡献 0.3，retention 贡献 0.2
+    score = min(1.0, rc * 0.12 + max(0, w - 1.0) * 0.08 + r * 0.2 + 0.2)
+    return round(score, 2)
+
+
 def signal(kind: str, card_id: str, context: str = ""):
     """记录使用信号，同时更新 Ebbinghaus 遗忘曲线 retention"""
     _append_jsonl(SIGNALS_FILE, {
@@ -380,11 +390,13 @@ def signal(kind: str, card_id: str, context: str = ""):
             decayed = _ebbinghaus_decay(c, now)
             new_retention = round(min(1.0, decayed + retention_inc), 4)
             new_w = round(c.get("weight", 1.0) + weight_inc, 2)
+            new_importance = _calc_importance({**c, "weight": new_w, "retention": new_retention})
             _append_jsonl(CARDS_FILE, {
                 **c,
                 "weight": new_w,
                 "last_used_ts": iso_now(),
                 "retention": new_retention,
+                "importance": new_importance,
             })
             break
 
@@ -873,6 +885,10 @@ def main():
     # migrate
     sub.add_parser("migrate", help="从 self-learning-skills 迁移")
 
+    # recalc-importance
+    p_recalc = sub.add_parser("recalc-importance", help="基于信号数据批量重算所有卡片的 importance")
+    p_recalc.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+
     args = parser.parse_args()
 
     if args.command == "recall":
@@ -961,6 +977,30 @@ def main():
     elif args.command == "migrate":
         result = migrate_from_selflearning()
         print(json.dumps(result, ensure_ascii=False))
+
+    elif args.command == "recalc-importance":
+        cards = _load_jsonl(CARDS_FILE)
+        seen = {}
+        for c in reversed(cards):
+            cid = c.get("id", "")
+            if cid and cid not in seen:
+                seen[cid] = c
+        updated = []
+        for cid, c in seen.items():
+            old_imp = c.get("importance", 0.5)
+            new_imp = _calc_importance(c)
+            if abs(new_imp - old_imp) > 0.01:
+                updated.append((cid, c.get("title", "")[:50], old_imp, new_imp))
+                if not args.dry_run:
+                    _append_jsonl(CARDS_FILE, {**c, "importance": new_imp})
+        print(f"\n── 重算 importance ({len(updated)} 张卡片变更) ──\n")
+        if not updated:
+            print("  (所有卡片 importance 无需更新)")
+        for cid, title, old, new in updated:
+            print(f"  [{cid}] {title}")
+            print(f"      {old:.2f} → {new:.2f}")
+        if args.dry_run:
+            print(f"\n[dry-run] 以上 {len(updated)} 张卡片未实际写入")
 
     else:
         parser.print_help()
