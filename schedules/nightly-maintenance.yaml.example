@@ -25,9 +25,20 @@ prompt: |-
   - 一修到底：发现bug直接edit_file修复源码，不记录等人工
   - 越跑越聪明：巡检发现沉淀为元认知，指导下一次
 
-  ## 第 0 步：上下文准备
+  ## 上下文管理（防超长链中断）
+  本任务共 13 步，中间产物累积易导致上下文溢出。每完成一个阶段（Step 0-4 / 5-9 / 10-13），必须执行以下操作：
+  1. **写进度文件** temp/inspection_state.json，记录：
+     - completed_steps: ["step0","step1",...]
+     - key_data: { total_cards, total_signals, anomalies_found, harvest_count, ... }
+     - 各步骤关键摘要（≤3条，每条≤50字）
+  2. **主动丢弃中间产物**：完成 checkpoint 后，后续步骤仅依赖进度文件中的摘要数据，不再回溯原始结果。禁止在脑中保留上一阶段大量细节。
+
+  ## 第 0 步：上下文准备 + 断点续跑
   前置条件：始终执行
-  - use_skill(skill_name="smart-memory", task="recall：召回近期巡检经验 -q '夜间巡检 记忆优化 异常修复 代码改进 提示词修正' --top 5 --days 14")
+  - 检查 temp/inspection_state.json 是否存在：
+    - **存在且 completed_steps 非空** → 读取进度文件，从第一个未完成步骤继续；本步其余操作跳过
+    - **不存在或 completed_steps 为空** → 全新执行：
+      - use_skill(skill_name="smart-memory", task="recall：召回近期巡检经验 -q '夜间巡检 记忆优化 异常修复 代码改进 提示词修正' --top 5 --days 14")
   - 记录执行前 cards.jsonl 行数和唯一 ID 数
 
   ## 第 1 步：数据收割（LLM 结构化，方法1）
@@ -92,6 +103,15 @@ prompt: |-
   - 修复后必须验证：重新执行检测步骤确认消除
   - 输出：发现 X 异常，自动修复 Y，Z 需人工
 
+  ---
+  **🔖 Checkpoint 1: 保存 Step 0-4 进度**
+  执行条件：完成任意一个 Step 1-4 后必须执行
+  - 更新 temp/inspection_state.json，completed_steps 追加 step0~step4 中已完成项
+  - key_data 记录：total_cards, total_signals, anomalies_found, retention_dashboard
+  - 摘要（≤3条×≤50字）：① 卡片/信号概况 ② 去重结果 ③ 异常修复概要
+  - **主动丢弃**：删除记忆中的 Step1~4 详细数据，后续仅依赖 state.json
+  ---
+
   ## 第 5 步：架构自评估
   前置条件：周一执行；或卡片总数变化 >10% 时触发；否则跳过
   评估四模块性能（encode/store/retrieve/manage）：
@@ -126,6 +146,15 @@ prompt: |-
   - index.json 不存在 → use_skill(skill_name="smart-memory", task="build-index：重建TF-IDF索引")
   - graph.json 不存在 或 cards.jsonl mtime > graph.json mtime → 执行 graph-build
   - 输出：每步执行/跳过 + 依据
+
+  ---
+  **🔖 Checkpoint 2: 保存 Step 5-9 进度**
+  执行条件：完成任意一个 Step 5-9 后必须执行
+  - 更新 temp/inspection_state.json，completed_steps 追加 step5~step9 中已完成项
+  - key_data 追加：arch_assessment, evolution_proposals, skills_updated, index_status
+  - 摘要（≤3条×≤50字）：① 架构评估结果 ② 自我进化提案/技能更新 ③ 索引状态
+  - **主动丢弃**：删除记忆中的 Step5~9 详细数据
+  ---
 
   ## 第 10 步：P3 知识精炼
   前置条件：卡片总数变化时执行；否则跳过
