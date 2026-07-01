@@ -80,8 +80,12 @@ def _append_jsonl(path: Path, obj: Dict):
 
 def _write_json(path: Path, obj: Any):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.replace(path)
 
 def _read_json(path: Path) -> Any:
     if not path.exists():
