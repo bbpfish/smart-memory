@@ -417,6 +417,25 @@ def recall(query: str = "", tags: List[str] = None, top_k: int = 10,
     return results[:top_k]
 
 
+def _repair_encoding(text: str) -> str:
+    """修复 Latin-1 误读 UTF-8 字节产生的编码损坏（mojibake）。
+    
+    症状: "æ¸\x85ç\x90\x86" → 应恢复为 "清理"
+    原理: UTF-8 编码的中文字节被当作 Latin-1/CP1252 解码后，
+         再次以 UTF-8 写入，形成双重编码损坏。逆转此过程。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    try:
+        restored = text.encode("latin-1").decode("utf-8")
+        # 仅当恢复后包含真实中文字符时才认为修复成功
+        if restored != text and any('\u4e00' <= c <= '\u9fff' for c in restored):
+            return restored
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return text
+
+
 def _normalize_sig(text: str) -> str:
     """标准化签名文本：去首尾空白、压缩连续空格、统一换行"""
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -429,6 +448,15 @@ def record(title: str, when_to_use: str, problem: str,
     """
     记录一条知识卡片，自动去重与索引，自动写信号。
     """
+    # 修复可能从 subprocess GBK 边界传入的编码损坏
+    title = _repair_encoding(title)
+    when_to_use = _repair_encoding(when_to_use)
+    problem = _repair_encoding(problem)
+    solution_steps = [_repair_encoding(s) for s in (solution_steps or [])]
+    evidence = [_repair_encoding(s) for s in (evidence or [])]
+    tags = [_repair_encoding(s) for s in (tags or [])]
+    gotchas = [_repair_encoding(s) for s in (gotchas or [])]
+
     # 标准化签名文本（去空格差异、大小写差异）
     sig_title = _normalize_sig(title)
     sig_when = _normalize_sig(when_to_use)
@@ -968,17 +996,17 @@ def migrate_from_selflearning():
             skipped += 1
             continue
 
-        # 转换格式
+        # 转换格式（修复旧数据中可能存在的编码损坏）
         new_card = {
             "id": cid,
             "ts": c.get("ts", iso_now()),
-            "title": title,
-            "when_to_use": c.get("when_to_use", ""),
-            "problem": c.get("problem", ""),
-            "solution_steps": c.get("solution_steps", []),
-            "evidence": c.get("evidence", []),
-            "tags": c.get("tags", []),
-            "gotchas": c.get("gotchas", []),
+            "title": _repair_encoding(title),
+            "when_to_use": _repair_encoding(c.get("when_to_use", "")),
+            "problem": _repair_encoding(c.get("problem", "")),
+            "solution_steps": [_repair_encoding(s) for s in (c.get("solution_steps") or [])],
+            "evidence": [_repair_encoding(s) for s in (c.get("evidence") or [])],
+            "tags": [_repair_encoding(s) for s in (c.get("tags") or [])],
+            "gotchas": [_repair_encoding(s) for s in (c.get("gotchas") or [])],
             "scope": c.get("scope", "project"),
             "weight": 1.0,
             "reinforced_count": 0,
