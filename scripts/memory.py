@@ -143,7 +143,7 @@ class TfidfIndex:
     def add(self, doc_id: str, text: str, weight: float = 1.0):
         tokens = self._tokenize(text)
         tf = Counter(tokens)
-        self.documents[doc_id] = {"tokens": tokens, "weights": dict(tf), "base_weight": weight}
+        self.documents[doc_id] = {"weights": dict(tf), "base_weight": weight}
         # 更新 IDF
         n = len(self.documents)
         for token in set(tokens):
