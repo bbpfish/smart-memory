@@ -45,6 +45,7 @@ VECTOR_INDEX_FILE = KNOWLEDGE_DIR / "index_vectors.npz"
 INDEX_META_FILE = KNOWLEDGE_DIR / "index_meta.json"
 RECS_FILE = STORE_ROOT / "recommendations.jsonl"
 SIGNALS_FILE = STORE_ROOT / "signals.jsonl"
+BASELINE_FILE = KNOWLEDGE_DIR / "retention_baseline.json"
 INDEX_MD = STORE_ROOT / "INDEX.md"
 
 # ── 工具函数 ──────────────────────────────────────────
@@ -650,12 +651,15 @@ def _calc_importance(card: Dict) -> float:
     return round(score, 2)
 
 
-def batch_decay(dry_run: bool = False) -> Dict:
+def batch_decay(dry_run: bool = False, save_baseline: bool = False) -> Dict:
     """批量更新所有卡片的 retention 和 importance
 
     对每张卡片：先用 Ebbinghaus 遗忘曲线计算当前 retention，
     再基于新 retention 重算 importance。
     仅回写有变化的卡片。
+
+    save_baseline=True 时，先保存衰减前的 retention 快照到 baseline 文件，
+    供巡检任务对比两次 recalc-decay 之间的真实衰减。
     """
     cards = _load_jsonl(CARDS_FILE)
     seen = {}
@@ -663,6 +667,9 @@ def batch_decay(dry_run: bool = False) -> Dict:
         cid = c.get("id", "")
         if cid and cid not in seen:
             seen[cid] = c
+
+    if save_baseline:
+        _save_baseline(seen)
 
     now = _dt.datetime.now(_dt.timezone.utc)
     total = len(seen)
@@ -691,6 +698,98 @@ def batch_decay(dry_run: bool = False) -> Dict:
         "importance_updated": importance_changed,
         "dry_run": dry_run,
     }
+
+
+def _save_baseline(cards: Dict[str, Dict]) -> None:
+    """保存 retention baseline 快照，用于巡检对比衰减"""
+    snapshot = {}
+    for cid, c in cards.items():
+        snapshot[cid] = {
+            "retention": c.get("retention", 1.0),
+            "importance": c.get("importance", 0.5),
+        }
+    data = {"saved_at": iso_now(), "cards": snapshot}
+    BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(BASELINE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _load_baseline() -> Optional[Dict]:
+    """加载 retention baseline"""
+    if not BASELINE_FILE.exists():
+        return None
+    with open(BASELINE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def decay_report() -> Dict:
+    """对比 baseline 与当前 retention，输出衰减报告
+
+    返回：
+    - baseline_age_hours: baseline 距今小时数
+    - total_in_baseline: baseline 中的卡片数
+    - total_current: 当前卡片数（去重）
+    - total_decayed: retention 下降 > 20% 的卡片数
+    - total_new: 不在 baseline 中的新卡片
+    - decayed_cards: [{id, baseline_ret, current_ret, drop_pct, importance}]
+    """
+    baseline = _load_baseline()
+    if baseline is None:
+        return {"error": "no_baseline", "message": "尚未保存 baseline，请先执行 recalc-decay --save-baseline"}
+
+    baseline_cards = baseline.get("cards", {})
+    saved_at = baseline.get("saved_at", "")
+    try:
+        age = (_dt.datetime.now(_dt.timezone.utc) - _ts_to_dt(saved_at)).total_seconds() / 3600.0
+    except Exception:
+        age = 0.0
+
+    # 读取当前卡片（去重取最新）
+    cards = _load_jsonl(CARDS_FILE)
+    seen = {}
+    for c in reversed(cards):
+        cid = c.get("id", "")
+        if cid and cid not in seen:
+            seen[cid] = c
+
+    decayed = []
+    new_cards = 0
+    missing_cards = 0
+    for cid, c in seen.items():
+        cur_ret = c.get("retention", 1.0)
+        if cid not in baseline_cards:
+            new_cards += 1
+            continue
+        base_ret = baseline_cards[cid]["retention"]
+        if base_ret <= 0:
+            continue
+        drop = (base_ret - cur_ret) / base_ret
+        if drop > 0.2:
+            decayed.append({
+                "id": cid,
+                "baseline_retention": base_ret,
+                "current_retention": cur_ret,
+                "drop_pct": round(drop * 100, 1),
+                "importance": c.get("importance", 0.5),
+                "last_used_ts": c.get("last_used_ts", ""),
+            })
+
+    # 统计 baseline 中有但当前已消失的卡片
+    missing_cards = len(baseline_cards) - (len(seen) - new_cards)
+
+    decayed.sort(key=lambda x: x["drop_pct"], reverse=True)
+
+    result = {
+        "baseline_age_hours": round(age, 1),
+        "baseline_saved_at": saved_at,
+        "total_in_baseline": len(baseline_cards),
+        "total_current": len(seen),
+        "total_decayed": len(decayed),
+        "total_new": new_cards,
+        "total_missing": max(0, missing_cards),
+        "decayed_cards": decayed,
+    }
+    return result
 
 
 def signal(kind: str, card_id: str, context: str = ""):
@@ -1733,6 +1832,10 @@ def main():
     # recalc-decay
     p_decay = sub.add_parser("recalc-decay", help="批量更新所有卡片的 retention（遗忘曲线）和 importance")
     p_decay.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+    p_decay.add_argument("--save-baseline", action="store_true", help="衰减前保存 retention 快照，供巡检对比")
+
+    # decay-report
+    p_dr = sub.add_parser("decay-report", help="对比 baseline 与当前 retention，输出衰减报告")
 
     # synthesize
     p_syn = sub.add_parser("synthesize", help="聚类相似卡片并生成知识合成卡片")
@@ -1887,14 +1990,20 @@ def main():
             print(f"\n[dry-run] 以上 {len(updated)} 张卡片未实际写入")
 
     elif args.command == "recalc-decay":
-        result = batch_decay(dry_run=args.dry_run)
+        result = batch_decay(dry_run=args.dry_run, save_baseline=args.save_baseline)
         print(f"\n── 批量衰减 ({result['total_cards']} 张卡片) ──\n")
         print(f"retention 更新: {result['retention_updated']} 张")
         print(f"importance 更新: {result['importance_updated']} 张")
         if result["retention_updated"] == 0 and result["importance_updated"] == 0:
             print("  (所有卡片保持最新，无需更新)")
+        if args.save_baseline:
+            print("baseline 已保存")
         if args.dry_run:
             print(f"\n[dry-run] 以上变更未实际写入")
+
+    elif args.command == "decay-report":
+        result = decay_report()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
     elif args.command == "synthesize":
         result = synthesize(threshold=args.threshold,

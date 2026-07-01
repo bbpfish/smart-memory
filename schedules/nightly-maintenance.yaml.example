@@ -48,10 +48,13 @@ prompt: |-
 
   ## 第 3 步：遗忘曲线巡检
   前置条件：始终执行
-  - retention < 0.1 且 30 天无信号 → 待废弃候选
-  - importance > 0.7 且 retention < 0.3 → 高价值遗忘警报
-  - 按 importance 分段统计 retention 均值，检测任一段是否较上日下降 >20%
-  - 输出遗忘仪表盘
+  - use_skill(skill_name="smart-memory", task="decay-report：对比 baseline 与当前 retention，检测衰减")
+  - 结果解读：
+    * baseline_age_hours < 12 → 跳过（距上次 recalc-decay 不足半天，衰减无意义）
+    * total_decayed > 0 → 告警：衰减卡片详情（ID、基线保留率、当前保留率、下降幅度、最后使用时间）
+    * total_decayed = 0 且 baseline_age_hours > 48 → 标注「48h 零衰减」，卡片生态稳定
+    * 若返回 error "no_baseline" → 首次运行，输出当前 retention 分布供人工审视，跳过衰减对比
+  - 输出遗忘仪表盘：衰减候选数、最大衰减幅度、当前保留率分布
 
   ## 第 4 步：异常检测 + 自动修复（Reflexion 模式）
   前置条件：始终执行
@@ -118,9 +121,9 @@ prompt: |-
 
   10.3 信号分析 + retention & importance 重算：
   - use_skill(skill_name="smart-memory", task="signal-analysis：基于30天信号数据更新成熟度评分 --days 30 --auto-write")
-  - use_skill(skill_name="smart-memory", task="recalc-decay：批量更新所有卡片的 retention（遗忘曲线）和 importance")
+  - use_skill(skill_name="smart-memory", task="recalc-decay：批量更新所有卡片的 retention（遗忘曲线）和 importance --save-baseline")
   - use_skill(skill_name="smart-memory", task="compact：压缩 cards.jsonl 去除 recalc-decay 产生的重复行")
-  - 输出：retention 更新数、importance 更新数、分布变化
+  - 输出：retention 更新数、importance 更新数、baseline 保存状态
 
   10.4 成熟度报告：
   - use_skill(skill_name="smart-memory", task="maturity：知识成熟度报告 --limit 50")
