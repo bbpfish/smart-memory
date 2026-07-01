@@ -465,6 +465,32 @@ def _repair_encoding(text: str) -> str:
     return text
 
 
+def _normalize_tags(tags: List[str]) -> List[str]:
+    """归一化标签列表：
+    把 ['tag1, tag2, tag3'] (单个逗号分隔字符串) 拆分为 ['tag1', 'tag2', 'tag3']，
+    并去除空白和空串。此修复解决 argparse nargs='*' 与 shell 引号组合导致的单元素逗号串问题。
+    """
+    normalized = []
+    for t in (tags or []):
+        for part in t.split(','):
+            part = part.strip()
+            if part:
+                normalized.append(part)
+    return normalized
+
+
+def _auto_compact_maybe():
+    """当 cards.jsonl 总行数超过唯一 ID 数的 1.3 倍时，自动触发 compact"""
+    cards = _load_jsonl(CARDS_FILE)
+    total = len(cards)
+    unique = len(set(c.get("id", "") for c in cards if c.get("id")))
+    if unique > 0 and total > unique * 1.3:
+        try:
+            compact()
+        except Exception:
+            pass  # compact 失败不影响主流程
+
+
 def _normalize_sig(text: str) -> str:
     """标准化签名文本：去首尾空白、压缩连续空格、统一换行"""
     return re.sub(r'\s+', ' ', text.strip().lower())
@@ -483,7 +509,7 @@ def record(title: str, when_to_use: str, problem: str,
     problem = _repair_encoding(problem)
     solution_steps = [_repair_encoding(s) for s in (solution_steps or [])]
     evidence = [_repair_encoding(s) for s in (evidence or [])]
-    tags = [_repair_encoding(s) for s in (tags or [])]
+    tags = _normalize_tags([_repair_encoding(s) for s in (tags or [])])
     gotchas = [_repair_encoding(s) for s in (gotchas or [])]
 
     # 标准化签名文本（去空格差异、大小写差异）
@@ -513,6 +539,7 @@ def record(title: str, when_to_use: str, problem: str,
                 idx.documents[card_id]["base_weight"] = new_card["weight"]
                 idx.save()
             signal("card_reinforced", card_id, context=title)
+            _auto_compact_maybe()
             return {"id": card_id, "action": "reinforced", "weight": new_card["weight"]}
 
         # 标题相似匹配（前 50 字符完全相同 → 视为同一经验）
@@ -541,6 +568,7 @@ def record(title: str, when_to_use: str, problem: str,
             index_text = f"{new_card.get('title','')} {new_card.get('when_to_use','')} {new_card.get('problem','')} {' '.join(new_card.get('tags',[]))}"
             vidx.add(old_id, index_text)
             vidx.save()
+            _auto_compact_maybe()
             return {"id": old_id, "action": "merged", "weight": new_card["weight"]}
 
     # 新卡片 — 写入前做二次去重检查（防护并发写入导致重复行）
@@ -577,6 +605,7 @@ def record(title: str, when_to_use: str, problem: str,
                           "reinforced_count": old.get("reinforced_count", 0) + 1}
             _append_jsonl(CARDS_FILE, merged_card)
             signal("card_reinforced", card_id, context=f"concurrent dedup: {title[:60]}")
+            _auto_compact_maybe()
             return {"id": card_id, "action": "reinforced_concurrent", "weight": merged_card["weight"]}
     _append_jsonl(CARDS_FILE, card)
 
@@ -593,6 +622,7 @@ def record(title: str, when_to_use: str, problem: str,
     # 自动写信号
     signal("card_recorded", card_id, context=title[:80])
 
+    _auto_compact_maybe()
     return {"id": card_id, "action": "created", "weight": 1.0}
 
 
