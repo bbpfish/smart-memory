@@ -315,12 +315,13 @@ def record(title: str, when_to_use: str, problem: str,
         "reinforced_count": 0,
         "status": "active",
         "retention": 1.0,
-        "importance": 0.5,
     }
     # Merge kwargs keys not already in card
     for k, v in kwargs.items():
         if k not in card:
             card[k] = v
+    # Ensure importance default if not provided via kwargs
+    card.setdefault("importance", 0.5)
     # 二次确认：重新读取文件最新状态，避免并发/批量写入导致的 ID 重复
     final_check = _load_jsonl(CARDS_FILE)
     for old in reversed(final_check):
