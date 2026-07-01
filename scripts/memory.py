@@ -92,8 +92,11 @@ def _write_json(path: Path, obj: Any):
 def _read_json(path: Path) -> Any:
     if not path.exists():
         return None
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
 
 # ── TF-IDF 简易索引 ───────────────────────────────────
 class TfidfIndex:
@@ -110,6 +113,13 @@ class TfidfIndex:
         if data:
             self.documents = data.get("documents", {})
             self.idf = data.get("idf", {})
+        elif self.index_path.exists():
+            # 索引文件存在但损坏 → 自动从 cards.jsonl 重建
+            build_index()
+            data = _read_json(self.index_path)
+            if data:
+                self.documents = data.get("documents", {})
+                self.idf = data.get("idf", {})
         return self
 
     def save(self):
