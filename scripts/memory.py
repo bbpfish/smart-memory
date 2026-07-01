@@ -41,6 +41,7 @@ SESSION_DIR = STORE_ROOT / "sessions"
 KNOWLEDGE_DIR = STORE_ROOT / "knowledge"
 CARDS_FILE = KNOWLEDGE_DIR / "cards.jsonl"
 INDEX_FILE = KNOWLEDGE_DIR / "index.json"
+VECTOR_INDEX_FILE = KNOWLEDGE_DIR / "index_vectors.npz"
 RECS_FILE = STORE_ROOT / "recommendations.jsonl"
 SIGNALS_FILE = STORE_ROOT / "signals.jsonl"
 INDEX_MD = STORE_ROOT / "INDEX.md"
@@ -173,13 +174,171 @@ class TfidfIndex:
         return sorted(scores.items(), key=lambda x: -x[1])[:top_k]
 
 
+# ══════════════════════════════════════════════════════
+# P2: 向量语义检索索引（ONNX + MiniLM 多语言模型）
+# ══════════════════════════════════════════════════════
+import numpy as np  # noqa: E402
+
+_MODEL_DIR = SKILL_DIR / "models" / "paraphrase-multilingual-MiniLM-L12-v2"
+_VECTOR_DIM = 384  # MiniLM-L12 输出维度
+_MAX_SEQ_LEN = 128
+
+
+class VectorIndex:
+    """语义向量索引，基于 ONNX 多语言 MiniLM 模型
+
+    PURE STRATEGY: 在现有 TF-IDF 之上叠加语义检索，不替代
+    """
+
+    _session = None
+    _tokenizer = None
+
+    def __init__(self, index_path: Path = VECTOR_INDEX_FILE):
+        self.index_path = index_path
+        self.ids: List[str] = []
+        self.vectors: Optional[np.ndarray] = None  # shape (n, 384)
+
+    # ── 模型懒加载（进程级单例）─────────────────────
+    @classmethod
+    def _get_session(cls):
+        if cls._session is None:
+            import onnxruntime  # noqa: E402
+            cls._session = onnxruntime.InferenceSession(
+                str(_MODEL_DIR / "onnx" / "model_quint8_avx2.onnx"),
+                providers=["CPUExecutionProvider"],
+            )
+        return cls._session
+
+    @classmethod
+    def _get_tokenizer(cls):
+        if cls._tokenizer is None:
+            from tokenizers import Tokenizer  # noqa: E402
+            cls._tokenizer = Tokenizer.from_file(str(_MODEL_DIR / "tokenizer.json"))
+        return cls._tokenizer
+
+    @classmethod
+    def _embed(cls, texts: List[str]) -> np.ndarray:
+        """批量文本 → L2 归一化向量"""
+        if not texts:
+            return np.empty((0, _VECTOR_DIM), dtype=np.float32)
+        tokenizer = cls._get_tokenizer()
+        session = cls._get_session()
+        # Tokenize
+        input_ids_list = []
+        masks = []
+        for t in texts:
+            enc = tokenizer.encode(t)
+            ids = enc.ids[:_MAX_SEQ_LEN]
+            m = enc.attention_mask[:_MAX_SEQ_LEN]
+            pad = _MAX_SEQ_LEN - len(ids)
+            if pad > 0:
+                ids += [0] * pad
+                m += [0] * pad
+            input_ids_list.append(ids)
+            masks.append(m)
+        input_ids = np.array(input_ids_list, dtype=np.int64)
+        attention_mask = np.array(masks, dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
+        # Inference
+        outputs = session.run(None, {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        })
+        embeddings = outputs[0].astype(np.float32)
+        # Mean pooling + L2 normalize
+        mask_exp = attention_mask[:, :, np.newaxis].astype(np.float32)
+        summed = np.sum(embeddings * mask_exp, axis=1)
+        count = np.clip(np.sum(mask_exp, axis=1), 1e-9, None)
+        mean = summed / count
+        norms = np.linalg.norm(mean, axis=1, keepdims=True)
+        return mean / np.clip(norms, 1e-9, None)
+
+    @staticmethod
+    def _build_text(card: Dict) -> str:
+        """构造索引文本（与 TfidfIndex 对齐）"""
+        return f"{card.get('title','')} {card.get('when_to_use','')} {card.get('problem','')} {' '.join(card.get('tags',[]))}"
+
+    # ── 索引操作 ────────────────────────────────────
+    def load(self):
+        if self.index_path.exists():
+            data = np.load(self.index_path, allow_pickle=True)
+            self.ids = data["ids"].tolist()
+            self.vectors = data["vectors"]
+        else:
+            self.ids = []
+            self.vectors = None
+        return self
+
+    def save(self):
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            self.index_path,
+            ids=np.array(self.ids, dtype=object),
+            vectors=self.vectors if self.vectors is not None else np.empty((0, _VECTOR_DIM), dtype=np.float32),
+        )
+
+    def add(self, doc_id: str, text: str):
+        """添加单条文档向量"""
+        vec = self._embed([text])[0]
+        if doc_id in self.ids:
+            idx = self.ids.index(doc_id)
+            self.vectors[idx] = vec
+        else:
+            self.ids.append(doc_id)
+            if self.vectors is None:
+                self.vectors = np.array([vec], dtype=np.float32)
+            else:
+                self.vectors = np.vstack([self.vectors, vec])
+
+    def remove(self, doc_id: str):
+        if doc_id in self.ids:
+            idx = self.ids.index(doc_id)
+            self.ids.pop(idx)
+            if len(self.ids) == 0:
+                self.vectors = None
+            else:
+                self.vectors = np.delete(self.vectors, idx, axis=0)
+
+    def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """向量相似度搜索，返回 [(card_id, cosine_similarity), ...]"""
+        if self.vectors is None or len(self.ids) == 0:
+            return []
+        q_vec = self._embed([query])[0]
+        sims = np.dot(self.vectors, q_vec)  # (n,) cosine sim (向量已 L2 归一化)
+        top_indices = np.argsort(-sims)[:top_k]
+        return [(self.ids[i], float(sims[i])) for i in top_indices if sims[i] > 0]
+
+    def rebuild_from_cards(self, cards: List[Dict]):
+        """从 cards.jsonl 全量重建向量索引"""
+        latest: Dict[str, Dict] = {}
+        for c in cards:
+            cid = c.get("id", "")
+            if cid and c.get("status") != "deprecated":
+                latest[cid] = c
+        self.ids = list(latest.keys())
+        texts = [self._build_text(c) for c in latest.values()]
+        if texts:
+            self.vectors = self._embed(texts)
+        else:
+            self.vectors = None
+        self.save()
+        return len(self.ids)
+
+    @property
+    def count(self) -> int:
+        return len(self.ids)
+
+
 # ── 核心操作 ──────────────────────────────────────────
 
-def recall(query: str = "", tags: List[str] = None, top_k: int = 10, days: int = 30) -> List[Dict]:
+def recall(query: str = "", tags: List[str] = None, top_k: int = 10,
+           days: int = 30, mode: str = "hybrid") -> List[Dict]:
     """
-    任务前召回：TF-IDF 匹配 + 标签过滤 + 时间衰减
+    任务前召回：TF-IDF 匹配 + 向量语义检索 + 标签过滤 + 时间衰减
+
+    mode: "tfidf" | "vector" | "hybrid"（默认 hybrid）
     """
-    idx = TfidfIndex().load()
     cards_all = _load_jsonl(CARDS_FILE)
     # 建立 id→card 映射（取最新版本）
     card_map: Dict[str, Dict] = {}
@@ -188,13 +347,36 @@ def recall(query: str = "", tags: List[str] = None, top_k: int = 10, days: int =
         if cid:
             card_map[cid] = c
 
-    # 搜索
-    if query:
-        hits = idx.search(query, top_k=top_k * 2)
-    else:
+    if not query:
         # 无 query 时返回最近高权重的
         hits = [(cid, c.get("weight", 1.0)) for cid, c in card_map.items()]
         hits.sort(key=lambda x: -x[1])
+    else:
+        if mode == "tfidf":
+            idx = TfidfIndex().load()
+            hits = idx.search(query, top_k=top_k * 2)
+        elif mode == "vector":
+            vidx = VectorIndex().load()
+            hits = vidx.search(query, top_k=top_k * 2)
+        else:  # hybrid (default)
+            idx = TfidfIndex().load()
+            tfidf_hits = idx.search(query, top_k=top_k * 2)
+            vidx = VectorIndex().load()
+            vector_hits = vidx.search(query, top_k=top_k * 2)
+            # ── 分数融合：Reciprocal Rank Fusion + 原始分数加权 ──
+            # TF-IDF 分数归一化
+            tfidf_max = max((s for _, s in tfidf_hits), default=1.0)
+            tfidf_scores = {cid: s / max(tfidf_max, 0.01) for cid, s in tfidf_hits}
+            # Vector 分数（已在 0~1 的余弦相似度）
+            vector_scores = {cid: s for cid, s in vector_hits}
+            # 融合：TF-IDF 权重 0.4，向量权重 0.6
+            all_ids = set(tfidf_scores.keys()) | set(vector_scores.keys())
+            fused = {}
+            for cid in all_ids:
+                tf_score = tfidf_scores.get(cid, 0.0)
+                vec_score = vector_scores.get(cid, 0.0)
+                fused[cid] = tf_score * 0.4 + vec_score * 0.6
+            hits = sorted(fused.items(), key=lambda x: -x[1])[:top_k * 2]
 
     # 标签过滤
     if tags:
@@ -297,6 +479,11 @@ def record(title: str, when_to_use: str, problem: str,
             }
             _append_jsonl(CARDS_FILE, new_card)
             signal("card_merged", old_id, context=f"title match: {title[:60]}")
+            # 更新向量索引（文本可能扩展）
+            vidx = VectorIndex().load()
+            index_text = f"{new_card.get('title','')} {new_card.get('when_to_use','')} {new_card.get('problem','')} {' '.join(new_card.get('tags',[]))}"
+            vidx.add(old_id, index_text)
+            vidx.save()
             return {"id": old_id, "action": "merged", "weight": new_card["weight"]}
 
     # 新卡片 — 写入前做二次去重检查（防护并发写入导致重复行）
@@ -341,6 +528,10 @@ def record(title: str, when_to_use: str, problem: str,
     idx = TfidfIndex().load()
     idx.add(card_id, index_text, weight=1.0)
     idx.save()
+    # 向量索引
+    vidx = VectorIndex().load()
+    vidx.add(card_id, index_text)
+    vidx.save()
 
     # 自动写信号
     signal("card_recorded", card_id, context=title[:80])
@@ -735,7 +926,7 @@ def compact() -> Dict:
 
 
 def build_index():
-    """全量重建索引"""
+    """全量重建索引（TF-IDF + 向量）"""
     cards = _load_jsonl(CARDS_FILE)
     latest: Dict[str, Dict] = {}
     for c in cards:
@@ -743,6 +934,7 @@ def build_index():
         if cid:
             latest[cid] = c
 
+    # TF-IDF 索引
     idx = TfidfIndex()
     for cid, c in latest.items():
         if c.get("status") == "deprecated":
@@ -750,7 +942,13 @@ def build_index():
         text = f"{c.get('title','')} {c.get('when_to_use','')} {c.get('problem','')} {' '.join(c.get('tags',[]))}"
         idx.add(cid, text, weight=c.get("weight", 1.0))
     idx.save()
-    return len(idx.documents)
+
+    # 向量索引
+    vidx = VectorIndex()
+    active_cards = [c for c in latest.values() if c.get("status") != "deprecated"]
+    n_vec = vidx.rebuild_from_cards(active_cards)
+
+    return {"tfidf_docs": len(idx.documents), "vector_docs": n_vec}
 
 
 def migrate_from_selflearning():
@@ -831,6 +1029,7 @@ def main():
     p_recall.add_argument("--tags", "-t", nargs="*", help="标签过滤")
     p_recall.add_argument("--top", type=int, default=10, help="返回数量")
     p_recall.add_argument("--days", type=int, default=30, help="时间范围（天）")
+    p_recall.add_argument("--mode", default="hybrid", choices=["tfidf", "vector", "hybrid"], help="检索模式")
     p_recall.add_argument("--format", default="text", choices=["text", "json"])
 
     # record
@@ -892,11 +1091,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == "recall":
-        results = recall(query=args.query, tags=args.tags, top_k=args.top, days=args.days)
+        results = recall(query=args.query, tags=args.tags, top_k=args.top, days=args.days, mode=args.mode)
         if args.format == "json":
             print(json.dumps(results, ensure_ascii=False, indent=2))
         else:
-            print(f"\n── 记忆召回 (query='{args.query}', top={len(results)}) ──\n")
+            print(f"\n── 记忆召回 (query='{args.query}', mode={args.mode}, top={len(results)}) ──\n")
             for i, r in enumerate(results, 1):
                 print(f"  [{i}] [{r['_score']:.2f}] {r['title']}  ({r['id']})")
                 print(f"      触发: {r.get('when_to_use','')[:60]}")
@@ -961,7 +1160,7 @@ def main():
 
     elif args.command == "build-index":
         n = build_index()
-        print(f"index rebuilt: {n} documents")
+        print(f"index rebuilt: TF-IDF={n['tfidf_docs']}, vector={n['vector_docs']} documents")
 
     elif args.command == "compact":
         result = compact()
