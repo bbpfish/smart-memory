@@ -166,6 +166,13 @@ prompt: |-
   - 不修改 task_id / created_time / from_conversation_id / status
   - 输出：本次修正 M 处不匹配，prompt 已自动同步
 
+  12.4 ClawdHub 发布同步：
+  前置条件：本次 12.3 对 prompt 做了修正（M > 0）时执行；否则跳过
+  - 检查技能目录 SKILL.md 版本号 vs ClawdHub 市场版本（`npx clawhub info <slug>`）
+  - 若本地版本 > 市场版本 或 版本相同但代码有变更 → bump 版本号 → `npx clawhub publish` → Git 提交推送
+  - 发布后同步更新本模板文件
+  - 输出：ClawdHub 同步状态（已同步/已发布 vX.Y.Z / 跳过）
+
   ## 第 13 步：产出报告
   写入 output/nightly_maintenance_report.md：
   - 执行摘要：收割/修复/合成/关联/提案/提示词修正数量
