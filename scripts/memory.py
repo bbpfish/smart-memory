@@ -650,6 +650,49 @@ def _calc_importance(card: Dict) -> float:
     return round(score, 2)
 
 
+def batch_decay(dry_run: bool = False) -> Dict:
+    """批量更新所有卡片的 retention 和 importance
+
+    对每张卡片：先用 Ebbinghaus 遗忘曲线计算当前 retention，
+    再基于新 retention 重算 importance。
+    仅回写有变化的卡片。
+    """
+    cards = _load_jsonl(CARDS_FILE)
+    seen = {}
+    for c in reversed(cards):
+        cid = c.get("id", "")
+        if cid and cid not in seen:
+            seen[cid] = c
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    total = len(seen)
+    retention_changed = 0
+    importance_changed = 0
+
+    for cid, c in seen.items():
+        new_ret = _ebbinghaus_decay(c, now)
+        old_ret = c.get("retention", 1.0)
+        if abs(new_ret - old_ret) > 0.001:
+            retention_changed += 1
+            c["retention"] = new_ret
+
+        new_imp = _calc_importance(c)
+        old_imp = c.get("importance", 0.5)
+        if abs(new_imp - old_imp) > 0.01:
+            importance_changed += 1
+            c["importance"] = new_imp
+
+        if not dry_run and (abs(new_ret - old_ret) > 0.001 or abs(new_imp - old_imp) > 0.01):
+            _append_jsonl(CARDS_FILE, c)
+
+    return {
+        "total_cards": total,
+        "retention_updated": retention_changed,
+        "importance_updated": importance_changed,
+        "dry_run": dry_run,
+    }
+
+
 def signal(kind: str, card_id: str, context: str = ""):
     """记录使用信号，同时更新 Ebbinghaus 遗忘曲线 retention"""
     _append_jsonl(SIGNALS_FILE, {
@@ -1687,6 +1730,10 @@ def main():
     p_recalc = sub.add_parser("recalc-importance", help="基于信号数据批量重算所有卡片的 importance")
     p_recalc.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
 
+    # recalc-decay
+    p_decay = sub.add_parser("recalc-decay", help="批量更新所有卡片的 retention（遗忘曲线）和 importance")
+    p_decay.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+
     # synthesize
     p_syn = sub.add_parser("synthesize", help="聚类相似卡片并生成知识合成卡片")
     p_syn.add_argument("--threshold", type=float, default=0.6, help="相似度阈值 (0.0~1.0)")
@@ -1838,6 +1885,16 @@ def main():
             print(f"      {old:.2f} → {new:.2f}")
         if args.dry_run:
             print(f"\n[dry-run] 以上 {len(updated)} 张卡片未实际写入")
+
+    elif args.command == "recalc-decay":
+        result = batch_decay(dry_run=args.dry_run)
+        print(f"\n── 批量衰减 ({result['total_cards']} 张卡片) ──\n")
+        print(f"retention 更新: {result['retention_updated']} 张")
+        print(f"importance 更新: {result['importance_updated']} 张")
+        if result["retention_updated"] == 0 and result["importance_updated"] == 0:
+            print("  (所有卡片保持最新，无需更新)")
+        if args.dry_run:
+            print(f"\n[dry-run] 以上变更未实际写入")
 
     elif args.command == "synthesize":
         result = synthesize(threshold=args.threshold,
